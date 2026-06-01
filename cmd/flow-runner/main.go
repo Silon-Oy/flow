@@ -101,6 +101,19 @@ func pullAndRun(ctx context.Context, cli *centralclient.Client, runnerID, repoRo
 	defer runCancel()
 	go leaseHeartbeat(runCtx, cli, lz.ID, runCancel)
 
+	// Production isolation (§11.1): the runner creates the per-run worktree on
+	// the host, then launches a hardened, ephemeral orchestrator container whose
+	// ONLY host mount is that worktree (see internal/runnerexec.Spec for the
+	// exact, test-asserted docker run flag set). The container's entrypoint runs
+	// the same orchestration logic below, but inside the capability-dropped,
+	// read-only, egress-proxied sandbox.
+	//
+	// Vaihe 1 runs the orchestration in-process here so the central <-> runner
+	// protocol (lease, heartbeat, telemetry, S1-S12 sequencing) is exercised
+	// end-to-end without requiring Docker on the dev box. The container dispatch
+	// is the deploy-time path (docker-compose mounts the Docker socket into the
+	// trusted runner; the untrusted orchestrator container never gets it).
+	// FLOW_RUNNER_MODE=container selects the sandboxed path; default is inproc.
 	reporter := orchestrator.NewHTTPReporter(cli, runID)
 	cfg := orchestrator.Config{
 		RunID:       runID,
