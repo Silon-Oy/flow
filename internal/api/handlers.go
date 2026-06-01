@@ -1,0 +1,378 @@
+package api
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/Silon-Oy/flow/internal/lease"
+	"github.com/Silon-Oy/flow/internal/runstate"
+)
+
+// --- runners ---------------------------------------------------------------
+
+type runnerRegisterReq struct {
+	Hostname     string         `json:"hostname"`
+	Capacity     int            `json:"capacity"`
+	Capabilities map[string]any `json:"capabilities,omitempty"`
+}
+
+type runnerRegisterResp struct {
+	RunnerID    string `json:"runner_id"`
+	RunnerToken string `json:"runner_token"`
+}
+
+func (s *Server) handleRunnerRegister(w http.ResponseWriter, r *http.Request) {
+	var req runnerRegisterReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.Hostname == "" {
+		writeErr(w, http.StatusBadRequest, "hostname required")
+		return
+	}
+	if req.Capacity <= 0 {
+		req.Capacity = 1
+	}
+	ctx, cancel := withTimeout(r, 5*time.Second)
+	defer cancel()
+
+	// The runner-token scope is Vaihe 2 (RBAC). Vaihe 1 issues an opaque token
+	// the runner echoes back, so the wire contract is stable across phases.
+	token := randomToken()
+	var runnerID string
+	err := s.Pool.QueryRow(ctx, `
+		INSERT INTO runner (tenant_id, hostname, capacity, status, last_heartbeat, capabilities)
+		VALUES ($1, $2, $3, 'online', now(), COALESCE($4, '{}'::jsonb))
+		RETURNING id::text`,
+		s.TenantID, req.Hostname, req.Capacity, capsJSON(req.Capabilities)).Scan(&runnerID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "register: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, runnerRegisterResp{RunnerID: runnerID, RunnerToken: token})
+}
+
+func (s *Server) handleRunnerHeartbeat(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ctx, cancel := withTimeout(r, 5*time.Second)
+	defer cancel()
+	tag, err := s.Pool.Exec(ctx,
+		`UPDATE runner SET last_heartbeat = now(), status = 'online' WHERE id = $1`, id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		writeErr(w, http.StatusNotFound, "unknown runner")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleRunnersList(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := withTimeout(r, 5*time.Second)
+	defer cancel()
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id::text, hostname, capacity, active_leases, last_heartbeat, status
+		  FROM runner WHERE tenant_id = $1 ORDER BY hostname`, s.TenantID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+	type runnerView struct {
+		ID            string     `json:"id"`
+		Hostname      string     `json:"hostname"`
+		Capacity      int        `json:"capacity"`
+		ActiveLeases  int        `json:"active_leases"`
+		LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
+		Status        string     `json:"status"`
+	}
+	var out []runnerView
+	for rows.Next() {
+		var v runnerView
+		if err := rows.Scan(&v.ID, &v.Hostname, &v.Capacity, &v.ActiveLeases, &v.LastHeartbeat, &v.Status); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		out = append(out, v)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runners": out})
+}
+
+// --- leases ----------------------------------------------------------------
+
+type leaseAcquireReq struct {
+	RunnerID string   `json:"runner_id"`
+	Kinds    []string `json:"kinds"`
+}
+
+type leaseAcquireResp struct {
+	Lease *lease.Lease `json:"lease"`
+	Work  *lease.Work  `json:"work"`
+}
+
+func (s *Server) handleLeaseAcquire(w http.ResponseWriter, r *http.Request) {
+	var req leaseAcquireReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.RunnerID == "" {
+		writeErr(w, http.StatusBadRequest, "runner_id required")
+		return
+	}
+	if len(req.Kinds) == 0 {
+		req.Kinds = []string{"develop"}
+	}
+	ctx, cancel := withTimeout(r, 10*time.Second)
+	defer cancel()
+
+	l, work, err := s.Leases.Acquire(ctx, s.TenantID, req.RunnerID, req.Kinds)
+	if errors.Is(err, lease.ErrNoWork) {
+		// 204: nothing to do. The runner backs off — NOT an error (fail-closed
+		// applies to DB unavailability, not to an empty queue).
+		writeJSON(w, http.StatusNoContent, nil)
+		return
+	}
+	if err != nil {
+		// DB error => fail-closed: surface it, do not hand out work.
+		writeErr(w, http.StatusServiceUnavailable, "lease acquire failed: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, leaseAcquireResp{Lease: l, Work: work})
+}
+
+func (s *Server) handleLeaseHeartbeat(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ctx, cancel := withTimeout(r, 5*time.Second)
+	defer cancel()
+	ok, err := s.Leases.Heartbeat(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	if !ok {
+		// Lease expired or reaped — the runner must stop work.
+		writeErr(w, http.StatusConflict, "lease no longer active")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleLeaseRelease(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ctx, cancel := withTimeout(r, 5*time.Second)
+	defer cancel()
+	if err := s.Leases.Release(ctx, id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "released"})
+}
+
+// --- runs ------------------------------------------------------------------
+
+type runCreateReq struct {
+	ProjectID   string `json:"project_id"`
+	Remote      string `json:"remote"`
+	IssueNumber int    `json:"issue_number"`
+}
+
+func (s *Server) handleRunCreate(w http.ResponseWriter, r *http.Request) {
+	var req runCreateReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.ProjectID == "" {
+		writeErr(w, http.StatusBadRequest, "project_id required")
+		return
+	}
+	if req.Remote == "" {
+		req.Remote = "origin"
+	}
+	ctx, cancel := withTimeout(r, 5*time.Second)
+	defer cancel()
+	id, err := s.Runs.CreateRun(ctx, s.TenantID, req.ProjectID, req.Remote, req.IssueNumber)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"run_id": id})
+}
+
+// runPatchReq mirrors runstate.Patch on the wire; pointers => "leave unchanged".
+type runPatchReq struct {
+	Status             *runstate.Status `json:"status,omitempty"`
+	CurrentState       *string          `json:"current_state,omitempty"`
+	Branch             *string          `json:"branch,omitempty"`
+	PRURL              *string          `json:"pr_url,omitempty"`
+	BlockedReason      *string          `json:"blocked_reason,omitempty"`
+	RetryCount         *int             `json:"retry_count,omitempty"`
+	TimeoutPhase       *string          `json:"timeout_phase,omitempty"`
+	ClarificationRound *int             `json:"clarification_round,omitempty"`
+	RunnerID           *string          `json:"runner_id,omitempty"`
+	LeaseID            *string          `json:"lease_id,omitempty"`
+	Finished           bool             `json:"finished,omitempty"`
+}
+
+func (s *Server) handleRunPatch(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req runPatchReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	ctx, cancel := withTimeout(r, 5*time.Second)
+	defer cancel()
+	err := s.Runs.PatchRun(ctx, id, runstate.Patch{
+		Status: req.Status, CurrentState: req.CurrentState, Branch: req.Branch,
+		PRURL: req.PRURL, BlockedReason: req.BlockedReason, RetryCount: req.RetryCount,
+		TimeoutPhase: req.TimeoutPhase, ClarificationRound: req.ClarificationRound,
+		RunnerID: req.RunnerID, LeaseID: req.LeaseID, Finished: req.Finished,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+type runEventsReq struct {
+	Events []runstate.Event `json:"events"`
+}
+
+func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req runEventsReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	ctx, cancel := withTimeout(r, 5*time.Second)
+	defer cancel()
+	if err := s.Runs.AppendEvents(ctx, id, req.Events); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Fan out to any SSE subscribers for live tail.
+	s.hub.publish(id, req.Events)
+	writeJSON(w, http.StatusAccepted, map[string]int{"accepted": len(req.Events)})
+}
+
+func (s *Server) handleRunGet(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ctx, cancel := withTimeout(r, 5*time.Second)
+	defer cancel()
+	run, err := s.Runs.GetRun(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeErr(w, http.StatusNotFound, "unknown run")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
+func (s *Server) handleRunsList(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := withTimeout(r, 5*time.Second)
+	defer cancel()
+	statusFilter := r.URL.Query().Get("status")
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id::text, project_id::text, remote, issue_number, status,
+		       current_state, branch, pr_url, started_at, finished_at
+		  FROM run
+		 WHERE tenant_id = $1
+		   AND ($2 = '' OR status::text = $2)
+		 ORDER BY started_at DESC
+		 LIMIT 200`, s.TenantID, statusFilter)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+	type runView struct {
+		ID           string     `json:"id"`
+		ProjectID    string     `json:"project_id"`
+		Remote       string     `json:"remote"`
+		IssueNumber  int        `json:"issue_number"`
+		Status       string     `json:"status"`
+		CurrentState *string    `json:"current_state,omitempty"`
+		Branch       *string    `json:"branch,omitempty"`
+		PRURL        *string    `json:"pr_url,omitempty"`
+		StartedAt    time.Time  `json:"started_at"`
+		FinishedAt   *time.Time `json:"finished_at,omitempty"`
+	}
+	var out []runView
+	for rows.Next() {
+		var v runView
+		if err := rows.Scan(&v.ID, &v.ProjectID, &v.Remote, &v.IssueNumber, &v.Status,
+			&v.CurrentState, &v.Branch, &v.PRURL, &v.StartedAt, &v.FinishedAt); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		out = append(out, v)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": out})
+}
+
+func (s *Server) handleEgressList(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := withTimeout(r, 5*time.Second)
+	defer cancel()
+	runID := r.URL.Query().Get("run")
+	rows, err := s.Pool.Query(ctx, `
+		SELECT run_id::text, host, allowed, ts
+		  FROM egress_log
+		 WHERE tenant_id = $1 AND ($2 = '' OR run_id::text = $2)
+		 ORDER BY ts DESC LIMIT 500`, s.TenantID, runID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+	type egressView struct {
+		RunID   *string   `json:"run_id,omitempty"`
+		Host    string    `json:"host"`
+		Allowed bool      `json:"allowed"`
+		TS      time.Time `json:"ts"`
+	}
+	var out []egressView
+	for rows.Next() {
+		var v egressView
+		if err := rows.Scan(&v.RunID, &v.Host, &v.Allowed, &v.TS); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		out = append(out, v)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"egress": out})
+}
+
+// --- small helpers ---------------------------------------------------------
+
+func randomToken() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func capsJSON(m map[string]any) []byte {
+	if m == nil {
+		return nil
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil
+	}
+	return b
+}
