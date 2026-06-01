@@ -1,0 +1,18 @@
+# Go build artifacts
+/bin/
+*.exe
+*.test
+*.out
+
+# Local env / secrets — never commit
+.env
+.env.local
+*.credentials.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Postgres data (when running compose locally)
+deploy/pgdata/

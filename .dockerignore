@@ -1,0 +1,14 @@
+.git
+.gitignore
+*.md
+docs/
+dashboard/node_modules/
+node_modules/
+.env
+.env.*
+*.credentials.json
+bin/
+*.test
+*.out
+deploy/pgdata/
+.DS_Store
