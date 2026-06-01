@@ -133,15 +133,20 @@ CREATE INDEX run_status_idx  ON run (status);
 
 -- ── RUN_EVENT ─────────────────────────────────────────────────────────────
 -- state.jsonl, row-per-row (event + JSONB data + ts). Append-only telemetry.
+-- seq is a monotonic insertion counter: when two events share a ts (a batch
+-- inserted within the same clock tick), seq preserves the order the runner
+-- emitted them. ORDER BY (ts, seq) is therefore a stable chronological-then-
+-- insertion order, which a random uuid PK cannot provide.
 CREATE TABLE run_event (
     id     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    seq    bigserial NOT NULL,
     run_id uuid NOT NULL REFERENCES run(id) ON DELETE CASCADE,
     event  text NOT NULL,
     data   jsonb NOT NULL DEFAULT '{}'::jsonb,
     ts     timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX run_event_run_idx ON run_event (run_id, ts);
+CREATE INDEX run_event_run_idx ON run_event (run_id, ts, seq);
 
 -- ── GITHUB_APP_INSTALL ──────────────────────────────────────────────────────
 -- Per tenant/org App installation. private_key_ref is a SECRET_REF pointer, not
