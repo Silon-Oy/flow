@@ -1,0 +1,97 @@
+# Flow MVP (Vaihe 1) self-host stack. Designed for a Tailscale-internal Studio /
+# VPS. Three long-lived services + Postgres; the untrusted per-run orchestrator
+# containers are launched on demand by flow-runner (NOT declared here) with the
+# §11.1 hardening flags.
+#
+# Secrets (runner token, GitHub token, Claude credential) are provided via env /
+# Docker secrets at deploy time — never committed. See .env.example.
+
+name: flow
+
+services:
+  postgres:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_USER: flow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: flow
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  flowd:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.flowd
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      FLOWD_ADDR: ":8080"
+      FLOW_DATABASE_URL: "postgres://flow:${POSTGRES_PASSWORD:?}@postgres:5432/flow?sslmode=disable"
+      FLOW_BOOTSTRAP_TENANT: ${FLOW_BOOTSTRAP_TENANT:-default}
+      FLOW_GITHUB_TOKEN: ${FLOW_GITHUB_TOKEN:-}
+      FLOW_SCAN_INTERVAL: ${FLOW_SCAN_INTERVAL:-60s}
+    ports:
+      - "8080:8080"
+
+  # The runner-host egress proxy (§11.2): default-deny allow-list. The per-run
+  # orchestrator containers attach ONLY to flow-egress and route out through here.
+  egress-proxy:
+    image: ubuntu/squid:latest
+    restart: always
+    cap_add:
+      - NET_ADMIN # required to install the iptables/ipset firewall
+    volumes:
+      - ./egress-proxy/init-firewall.sh:/init-firewall.sh:ro
+      - ./egress-proxy/squid.conf:/etc/squid/squid.conf:ro
+    networks:
+      - default
+      - flow-egress
+    # init-firewall runs before squid; egress logging -> §11.6.
+    command: ["bash", "-c", "/init-firewall.sh && squid -N"]
+
+  flow-runner:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.runner
+    restart: always
+    depends_on:
+      - flowd
+      - egress-proxy
+    environment:
+      FLOW_CENTRAL_URL: "http://flowd:8080"
+      FLOW_RUNNER_TOKEN: ${FLOW_RUNNER_TOKEN:-}
+      FLOW_REPO_ROOT: /work/repo
+      FLOW_POLL_INTERVAL: ${FLOW_POLL_INTERVAL:-15s}
+      HTTPS_PROXY: "http://egress-proxy:3128"
+    volumes:
+      # The runner launches per-run containers via the host Docker daemon. The
+      # daemon is trusted; the UNTRUSTED orchestrator containers never get the
+      # socket (§11.1 invariant).
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./work:/work
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.dashboard
+    restart: always
+    depends_on:
+      - flowd
+    environment:
+      FLOW_CENTRAL_URL: "http://flowd:8080"
+    ports:
+      - "8090:8090"
+
+networks:
+  # Isolated network the untrusted per-run containers attach to; the only route
+  # out is the egress proxy.
+  flow-egress:
+    internal: false

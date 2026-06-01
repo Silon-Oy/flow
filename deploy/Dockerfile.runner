@@ -1,0 +1,18 @@
+# flow-runner — the long-lived runner daemon. It registers, pulls work, and
+# launches a per-run hardened orchestrator container per acquired lease (§11.1).
+# Needs the Docker CLI to start those containers; it talks to the host Docker
+# socket (the daemon itself is trusted — only the per-run orchestrator container
+# is untrusted and never gets the socket).
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/flow-runner ./cmd/flow-runner
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates git docker.io gh \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/flow-runner /usr/local/bin/flow-runner
+ENTRYPOINT ["/usr/local/bin/flow-runner"]

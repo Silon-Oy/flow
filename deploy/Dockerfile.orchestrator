@@ -1,0 +1,36 @@
+# flow-orchestrator — the UNTRUSTED per-run image (§11.1). One ephemeral
+# container per run; it executes the S1–S12 machine and the claude-code agent.
+#
+# Derived from the R4-verified experiment image (~/.config/flow-experiment):
+# node:22-slim + baked @anthropic-ai/claude-code, run with the §11.1 hardening
+# flags (see docker-compose.yml / docker run invocation in cmd/flow-runner).
+# The R4 experiment proved claude-code plan-billing auth survives this hardening.
+#
+# Claude credential: NOT baked in. The runner provisions it as a file into the
+# container at run time (Model B, §11.5/§12) — the central service never sees it.
+
+# Build the orchestrator entrypoint as a static Go binary so the untrusted
+# runtime image carries no Go toolchain.
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/flow-orchestrator ./cmd/flow-runner
+
+FROM node:22-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @anthropic-ai/claude-code
+
+COPY --from=build /out/flow-orchestrator /usr/local/bin/flow-orchestrator
+
+# node user (uid 1000) exists in the base; the §11.1 docker run overrides this
+# to 65532 with --user, --read-only, --cap-drop=ALL, --tmpfs, no-new-privileges.
+USER node
+ENV HOME=/home/node
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/flow-orchestrator"]

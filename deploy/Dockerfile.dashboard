@@ -1,0 +1,14 @@
+# dashboard — read-only web view (decision 7). Static Go binary; the page itself
+# is embedded in the binary (dashboard/index.go), so there is nothing else to ship.
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/dashboard ./dashboard
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/dashboard /dashboard
+USER 65532:65532
+EXPOSE 8090
+ENTRYPOINT ["/dashboard"]
