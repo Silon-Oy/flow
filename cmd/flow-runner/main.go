@@ -11,11 +11,15 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Silon-Oy/flow/internal/centralclient"
 	"github.com/Silon-Oy/flow/internal/claude"
+	"github.com/Silon-Oy/flow/internal/ghclient"
+	"github.com/Silon-Oy/flow/internal/gitremote"
+	"github.com/Silon-Oy/flow/internal/issue"
 	"github.com/Silon-Oy/flow/internal/lease"
 	"github.com/Silon-Oy/flow/internal/orchestrator"
 )
@@ -114,15 +118,24 @@ func pullAndRun(ctx context.Context, cli *centralclient.Client, runnerID, repoRo
 	// is the deploy-time path (docker-compose mounts the Docker socket into the
 	// trusted runner; the untrusted orchestrator container never gets it).
 	// FLOW_RUNNER_MODE=container selects the sandboxed path; default is inproc.
+	// Fetch issue body + comments + image URLs on the trusted host BEFORE
+	// dispatching to the orchestrator. The orchestrator runs inside the
+	// hardened container (§11.1) and must not hold a GitHub token; doing the
+	// fetch here keeps the token out of the sandbox surface.
+	issueDoc, imageURLs := fetchIssueContext(ctx, work, repoRoot)
+
 	reporter := orchestrator.NewHTTPReporter(cli, runID)
 	cfg := orchestrator.Config{
-		RunID:       runID,
-		RepoRoot:    repoRoot,
-		Remote:      work.Remote,
-		Branch:      branchFor(work),
-		IssueNumber: work.IssueNumber,
-		IssuePrompt: "", // resolved from the issue body in a later pass
-		AutoMode:    true,
+		RunID:          runID,
+		RepoRoot:       repoRoot,
+		Remote:         work.Remote,
+		Branch:         branchFor(work),
+		IssueNumber:    work.IssueNumber,
+		IssueTitle:     issueDoc.title,
+		IssueBody:      issueDoc.body,
+		IssueComments:  issueDoc.comments,
+		IssueImageURLs: imageURLs,
+		AutoMode:       true,
 	}
 	o := orchestrator.New(cfg, claude.New(), reporter)
 	gitOps := orchestrator.ShellGitOps{Remote: work.Remote}
@@ -195,6 +208,61 @@ func durationOr(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// issueContext is the runner's view of a fetched issue before it becomes
+// orchestrator.Config.Issue* fields. A bare value type (no error) — fetch
+// failures are logged and degrade to an empty-context run rather than
+// blocking the lease that has already been acquired.
+type issueContext struct {
+	title    string
+	body     string
+	comments []orchestrator.IssueComment
+}
+
+// fetchIssueContext resolves the remote → owner/repo, calls FetchIssue, and
+// extracts image URLs. Any failure (no remote, missing token, network) is
+// reported as an empty context — the orchestrator still runs with whatever it
+// has so a transient GitHub outage doesn't strand the lease.
+func fetchIssueContext(ctx context.Context, work *lease.Work, repoRoot string) (issueContext, []string) {
+	remote := work.Remote
+	if remote == "" {
+		remote = "origin"
+	}
+	ownerRepo, ok := gitremote.ResolveRemoteToOwnerRepo(repoRoot, remote)
+	if !ok {
+		log.Printf("flow-runner: fetchIssueContext: cannot resolve remote %q in %s", remote, repoRoot)
+		return issueContext{}, nil
+	}
+	parts := strings.SplitN(ownerRepo, "/", 2)
+	if len(parts) != 2 {
+		log.Printf("flow-runner: fetchIssueContext: bad owner/repo %q", ownerRepo)
+		return issueContext{}, nil
+	}
+	owner, repo := parts[0], parts[1]
+
+	gh := ghclient.New(os.Getenv("FLOW_GITHUB_TOKEN"))
+	is, err := gh.FetchIssue(ctx, owner, repo, work.IssueNumber)
+	if err != nil {
+		log.Printf("flow-runner: FetchIssue %s/%s#%d: %v", owner, repo, work.IssueNumber, err)
+		return issueContext{}, nil
+	}
+	urls, err := issue.ExtractImageURLs(is.RawJSON)
+	if err != nil {
+		log.Printf("flow-runner: ExtractImageURLs: %v", err)
+		urls = nil
+	}
+	cs := make([]orchestrator.IssueComment, 0, len(is.Comments))
+	for _, c := range is.Comments {
+		// Strip run-issues bot comments here so the agent prompt sees only
+		// human/issue-author text. ExtractImageURLs already skips them; this
+		// keeps the prompt and the image list consistent.
+		if strings.Contains(c.Body, "run-issues:") {
+			continue
+		}
+		cs = append(cs, orchestrator.IssueComment{Author: c.Author, Body: c.Body})
+	}
+	return issueContext{title: is.Title, body: is.Body, comments: cs}, urls
 }
 
 func itoa(n int) string {

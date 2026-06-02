@@ -5,7 +5,14 @@
 package issue
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -112,4 +119,97 @@ func extractImageURLsFromText(text string) []string {
 		add(m)
 	}
 	return out
+}
+
+// DownloadResult records the outcome for one issue image.
+type DownloadResult struct {
+	URL  string // original URL
+	Path string // path on disk (empty if Err != nil)
+	Err  error
+}
+
+// DownloadImages downloads each URL into destDir (created if missing) and
+// returns a per-URL result. Per-URL errors do NOT abort the batch — agents can
+// still work with the issue body even when a single attachment is unreachable.
+// Filenames are deterministic ("00.png", "01.jpg" …) so re-runs overwrite the
+// same files; the extension is derived from the URL path or Content-Type and
+// falls back to ".bin".
+func DownloadImages(ctx context.Context, destDir string, urls []string) ([]DownloadResult, error) {
+	if len(urls) == 0 {
+		return nil, nil
+	}
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir %s: %w", destDir, err)
+	}
+	results := make([]DownloadResult, len(urls))
+	for i, u := range urls {
+		results[i] = downloadOne(ctx, destDir, i, u)
+	}
+	return results, nil
+}
+
+func downloadOne(ctx context.Context, destDir string, idx int, u string) DownloadResult {
+	res := DownloadResult{URL: u}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		res.Err = fmt.Errorf("http %d", resp.StatusCode)
+		return res
+	}
+	ext := extensionFor(u, resp.Header.Get("Content-Type"))
+	fname := fmt.Sprintf("%02d%s", idx, ext)
+	full := filepath.Join(destDir, fname)
+	f, err := os.Create(full)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		_ = f.Close()
+		_ = os.Remove(full)
+		res.Err = err
+		return res
+	}
+	if err := f.Close(); err != nil {
+		res.Err = err
+		return res
+	}
+	res.Path = full
+	return res
+}
+
+// extensionFor picks a sensible file extension. The URL's path basename is
+// checked first (covers user-images.githubusercontent.com/*.png and
+// markdown ![alt](https://x/y.png)); for bare GitHub user-attachments URLs
+// (which carry no extension) we fall back to the Content-Type, then ".bin".
+func extensionFor(rawURL, contentType string) string {
+	if i := strings.IndexByte(rawURL, '?'); i >= 0 {
+		rawURL = rawURL[:i]
+	}
+	base := path.Base(rawURL)
+	if ext := strings.ToLower(filepath.Ext(base)); ext != "" && len(ext) <= 5 {
+		return ext
+	}
+	switch strings.ToLower(strings.SplitN(contentType, ";", 2)[0]) {
+	case "image/png":
+		return ".png"
+	case "image/jpeg", "image/jpg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "image/svg+xml":
+		return ".svg"
+	}
+	return ".bin"
 }
