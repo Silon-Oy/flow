@@ -51,6 +51,8 @@ services:
     volumes:
       - ./egress-proxy/init-firewall.sh:/init-firewall.sh:ro
       - ./egress-proxy/squid.conf:/etc/squid/squid.conf:ro
+      # Shared with flow-runner so the §11.6 shipper can tail access.log.
+      - egress-log:/var/log/squid
     networks:
       - default
       - flow-egress
@@ -78,12 +80,16 @@ services:
       FLOW_RUNNER_NAME: ${FLOW_RUNNER_NAME:-}
       FLOW_CLAUDE_CRED_PATH: ${FLOW_CLAUDE_CRED_PATH:-}
       HTTPS_PROXY: "http://egress-proxy:3128"
+      # §11.6: shipper tails squid's access.log out of the shared volume.
+      FLOW_EGRESS_LOG: /var/log/squid/access.log
     volumes:
       # The runner launches per-run containers via the host Docker daemon. The
       # daemon is trusted; the UNTRUSTED orchestrator containers never get the
       # socket (§11.1 invariant).
       - /var/run/docker.sock:/var/run/docker.sock
       - ./work:/work
+      # Read squid's access.log out of the same named volume the proxy writes.
+      - egress-log:/var/log/squid:ro
 
   dashboard:
     build:
@@ -102,3 +108,8 @@ networks:
   # out is the egress proxy.
   flow-egress:
     internal: false
+
+volumes:
+  # Shared between egress-proxy (writer) and flow-runner (reader). Keeps the
+  # squid access.log on a Docker-managed volume rather than a host bind-mount.
+  egress-log:

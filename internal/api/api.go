@@ -67,8 +67,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/runs/{id}", s.handleRunGet)
 	mux.HandleFunc("GET /v1/runs/{id}/logs", s.handleRunLogs) // SSE
 
-	// Egress log (read-only, dashboard).
+	// Egress log: dashboard read + shipper ingest (§11.6).
 	mux.HandleFunc("GET /v1/egress", s.handleEgressList)
+	mux.HandleFunc("POST /v1/egress", s.handleEgressIngest)
 
 	return logRequests(mux)
 }
