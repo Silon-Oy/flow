@@ -97,7 +97,10 @@ FLOW_TEST_DSN="postgres://flow:flow@localhost:55432/flow?sslmode=disable" go tes
 
 - `flow-runner` ajaa orkestroinnin **in-process** oletuksena (kehityskoneella ei
   vaadita Dockeria). Tuotannon eristys = kovennettu per-ajo-kontti
-  (`internal/runnerexec`, `deploy/Dockerfile.orchestrator`); dispatch on
-  deploy-ajan polku (`FLOW_RUNNER_MODE=container`).
+  (`internal/runnerexec`, `deploy/Dockerfile.orchestrator`); dispatch on kytketty
+  ajoon: kun `FLOW_RUNNER_MODE=container`, host luo per-ajo-worktreen ja
+  dispatchaa orkestroinnin ephemeraaliin `flow-orchestrator orchestrate <run-id>`
+  -konttiin runnerexec.Spec:n §11.1-flagein. Kontti hakee run-configin
+  `GET /v1/runs/{id}`:llä; GitHub-tokenia ei koskaan välitetä env:iin (§11.3).
 - Skanneri pollaa GitHubia anonyymisti, jos `FLOW_GITHUB_TOKEN` puuttuu
   (rate-limitattu). Per-tenant App-broker tulee Vaiheessa 2.

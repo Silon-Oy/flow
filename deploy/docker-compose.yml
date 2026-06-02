@@ -70,6 +70,13 @@ services:
       FLOW_RUNNER_TOKEN: ${FLOW_RUNNER_TOKEN:-}
       FLOW_REPO_ROOT: /work/repo
       FLOW_POLL_INTERVAL: ${FLOW_POLL_INTERVAL:-15s}
+      # Container dispatch (§11.1): "container" launches each run inside a
+      # hardened ephemeral flow-orchestrator container; "inproc" keeps the
+      # orchestration in the runner process (dev default).
+      FLOW_RUNNER_MODE: ${FLOW_RUNNER_MODE:-container}
+      FLOW_ORCHESTRATOR_IMAGE: ${FLOW_ORCHESTRATOR_IMAGE:-flow-orchestrator:latest}
+      FLOW_RUNNER_NAME: ${FLOW_RUNNER_NAME:-}
+      FLOW_CLAUDE_CRED_PATH: ${FLOW_CLAUDE_CRED_PATH:-}
       HTTPS_PROXY: "http://egress-proxy:3128"
     volumes:
       # The runner launches per-run containers via the host Docker daemon. The
