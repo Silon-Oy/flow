@@ -2,6 +2,8 @@ package orchestrator
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -107,7 +109,8 @@ func TestOrchestratorHappyPath(t *testing.T) {
 
 	o := New(Config{
 		RunID: "20260602-rid-1", RepoRoot: repo, Remote: "origin",
-		Branch: "auto-run/issue-1", IssueNumber: 1, IssuePrompt: "do the thing", AutoMode: true,
+		Branch: "auto-run/issue-1", IssueNumber: 1,
+		IssueTitle: "Fix the thing", IssueBody: "do the thing", AutoMode: true,
 	}, c, rep)
 
 	out, err := o.Run(context.Background(), git)
@@ -152,6 +155,44 @@ func TestOrchestratorNeedsClarification(t *testing.T) {
 	}
 	if git.pushed {
 		t.Errorf("must NOT push when clarification needed")
+	}
+}
+
+// TestOrchestratorDownloadsIssueImages asserts that S4 + image-download wiring
+// lands files in <worktree>/.flow/issue-images/ on a successful run, proving
+// the FetchIssue → ExtractImageURLs → orchestrator → worktree pipeline.
+func TestOrchestratorDownloadsIssueImages(t *testing.T) {
+	repo := makeRepo(t)
+	rep := &fakeReporter{}
+	git := &fakeGitOps{}
+
+	imgSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte("PNG"))
+	}))
+	defer imgSrv.Close()
+
+	c := mockClaude("echo CYCLE_REVIEW_DECISION: PROCEED; echo IMPLEMENTER_RESULT: SUCCESS")
+	runID := "rid-images"
+	o := New(Config{
+		RunID: runID, RepoRoot: repo, Remote: "origin",
+		Branch: "auto-run/issue-9", IssueNumber: 9,
+		IssueTitle: "Render images", IssueBody: "see attached",
+		IssueImageURLs: []string{imgSrv.URL + "/a.png"},
+		AutoMode:       true,
+	}, c, rep)
+
+	out, err := o.Run(context.Background(), git)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Status != "completed" {
+		t.Fatalf("status = %q reason=%q step=%s", out.Status, out.Reason, out.LastStep)
+	}
+	wt := filepath.Join(repo, ".claude/worktrees", runID)
+	imagePath := filepath.Join(wt, ".flow/issue-images/00.png")
+	if _, err := os.Stat(imagePath); err != nil {
+		t.Errorf("expected image at %s, got %v", imagePath, err)
 	}
 }
 

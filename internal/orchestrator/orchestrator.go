@@ -11,9 +11,14 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"log"
+	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/Silon-Oy/flow/internal/claude"
 	"github.com/Silon-Oy/flow/internal/envbootstrap"
+	"github.com/Silon-Oy/flow/internal/issue"
 	"github.com/Silon-Oy/flow/internal/prompts"
 	"github.com/Silon-Oy/flow/internal/worktree"
 )
@@ -60,7 +65,18 @@ type Reporter interface {
 	Finalize(ctx context.Context, status, reason string) error
 }
 
+// IssueComment is one issue comment as it enters the agent prompt.
+type IssueComment struct {
+	Author string
+	Body   string
+}
+
 // Config carries the per-run inputs resolved from the lease + project config.
+//
+// The issue context is split into granular fields (title/body/comments/images)
+// so the orchestrator can fill the placeholders the prompt templates actually
+// declare ({{ISSUE_TITLE}}, {{ISSUE_BODY}}, {{ISSUE_COMMENTS}}, {{ISSUE_IMAGES}},
+// …) rather than dumping a single pre-rendered blob.
 type Config struct {
 	RunID       string
 	RepoRoot    string // the runner's clone (host path used to create the worktree)
@@ -68,7 +84,11 @@ type Config struct {
 	Branch      string // auto-run/<remote_label>-<slug>
 	BaseBranch  string // optional integration branch
 	IssueNumber int
-	IssuePrompt string // pre-rendered issue context for the agents
+
+	IssueTitle     string         // pre-rendered short title
+	IssueBody      string         // raw issue body (markdown ok)
+	IssueComments  []IssueComment // chronological, excluding run-issues:* bot markers
+	IssueImageURLs []string       // image URLs extracted from body + comments; downloaded after S4
 
 	// WorktreePath, when non-empty, is the already-populated worktree directory
 	// the orchestrator should use as-is (skips S4 worktree.Create). This is the
@@ -128,12 +148,17 @@ func (o *Orchestrator) Run(ctx context.Context, git GitOps) (Outcome, error) {
 	}
 	out.LastStep = StepWorktree
 
+	// Download issue images into the worktree (best-effort). The worktree path
+	// is the only host mount handed to the per-run container (§11.1), so images
+	// MUST live inside it or the agent can't read them. Per-URL failures don't
+	// abort the run — agents can still process the issue body.
+	imageReport := o.downloadIssueImages(ctx, wt)
+
+	promptValues := o.basePromptValues(wt, imageReport)
+
 	// S6: cycle review.
 	o.setState(ctx, StepCycleReview)
-	reviewPrompt := RenderPrompt(prompts.CycleReview, map[string]string{
-		"ISSUE":  o.cfg.IssuePrompt,
-		"BRANCH": o.cfg.Branch,
-	})
+	reviewPrompt := RenderPrompt(prompts.CycleReview, promptValues)
 	reviewRes, err := o.claude.Call(ctx, reviewPrompt)
 	if err == claude.ErrTimeout {
 		return o.fail(ctx, out, StepCycleReview, "timed_out", "cycle_review_timeout")
@@ -171,10 +196,9 @@ func (o *Orchestrator) Run(ctx context.Context, git GitOps) (Outcome, error) {
 
 	// S8: implementer.
 	o.setState(ctx, StepImplementer)
-	implPrompt := RenderPrompt(prompts.Implementer, map[string]string{
-		"ISSUE":  o.cfg.IssuePrompt,
-		"BRANCH": o.cfg.Branch,
-	})
+	implValues := cloneStringMap(promptValues)
+	implValues["CYCLE_REVIEW_OUTPUT"] = reviewRes.Output
+	implPrompt := RenderPrompt(prompts.Implementer, implValues)
 	implRes, err := o.claude.Call(ctx, implPrompt)
 	if err == claude.ErrTimeout {
 		return o.fail(ctx, out, StepImplementer, "timed_out", "implementer_timeout")
@@ -191,7 +215,9 @@ func (o *Orchestrator) Run(ctx context.Context, git GitOps) (Outcome, error) {
 
 	// S9: evolution (advisory; failure does not block).
 	o.setState(ctx, StepEvolution)
-	evoPrompt := RenderPrompt(prompts.Evolution, map[string]string{"BRANCH": o.cfg.Branch})
+	evoValues := cloneStringMap(promptValues)
+	evoValues["IMPLEMENTER_OUTPUT_TAIL"] = implRes.Output
+	evoPrompt := RenderPrompt(prompts.Evolution, evoValues)
 	if _, err := o.claude.Call(ctx, evoPrompt); err != nil && err != claude.ErrTimeout {
 		o.event(ctx, "evolution_skipped", map[string]string{"reason": err.Error()})
 	}
@@ -259,4 +285,149 @@ func (o *Orchestrator) fail(ctx context.Context, out Outcome, step Step, status,
 	out.Reason = reason
 	_ = o.report.Finalize(ctx, status, reason)
 	return out, nil
+}
+
+// issueImagesSubdir is the worktree-relative directory where downloaded issue
+// images land. Centralised so the prompt-rendering helper and the downloader
+// agree on one path.
+const issueImagesSubdir = ".flow/issue-images"
+
+// downloadIssueImages downloads every IssueImageURL into <wt>/.flow/issue-images/.
+// Errors are best-effort — a failed download is recorded in the result and the
+// run continues. Returns the per-URL results so the prompt can list both
+// successes (with disk paths) and failures (with the original URL).
+func (o *Orchestrator) downloadIssueImages(ctx context.Context, wt string) []issue.DownloadResult {
+	if len(o.cfg.IssueImageURLs) == 0 {
+		return nil
+	}
+	destDir := filepath.Join(wt, issueImagesSubdir)
+	results, err := issue.DownloadImages(ctx, destDir, o.cfg.IssueImageURLs)
+	if err != nil {
+		log.Printf("orchestrator: issue-image download dir setup: %v", err)
+		o.event(ctx, "issue_images_dir_failed", map[string]string{"reason": err.Error()})
+		return nil
+	}
+	ok, failed := 0, 0
+	for _, r := range results {
+		if r.Err == nil {
+			ok++
+		} else {
+			failed++
+			log.Printf("orchestrator: issue-image download failed: %s: %v", r.URL, r.Err)
+		}
+	}
+	o.event(ctx, "issue_images_downloaded", map[string]string{
+		"ok":     strconv.Itoa(ok),
+		"failed": strconv.Itoa(failed),
+	})
+	return results
+}
+
+// basePromptValues builds the placeholder map shared across all S6/S8/S9
+// prompts. Each step augments the returned map with step-specific keys
+// (CYCLE_REVIEW_OUTPUT, IMPLEMENTER_OUTPUT_TAIL); placeholders the templates
+// declare but this run does not provide (REPO_CLAUDE_MD, CLARIFICATION_CONTEXT,
+// RESTART_CONTEXT, RUN_ISSUES_DB_CLONE) get empty defaults so the rendered
+// prompt has no literal "{{KEY}}" leakage.
+func (o *Orchestrator) basePromptValues(wt string, images []issue.DownloadResult) map[string]string {
+	return map[string]string{
+		"REPO_ROOT":     o.cfg.RepoRoot,
+		"WORKTREE_PATH": wt,
+		"BRANCH":        o.cfg.Branch,
+
+		"ISSUE_NUMBER":   strconv.Itoa(o.cfg.IssueNumber),
+		"ISSUE_TITLE":    o.cfg.IssueTitle,
+		"ISSUE_BODY":     issueBodyText(o.cfg.IssueTitle, o.cfg.IssueBody),
+		"ISSUE_COMMENTS": renderComments(o.cfg.IssueComments),
+		"ISSUE_IMAGES":   renderImages(wt, images, o.cfg.IssueImageURLs),
+
+		// Defaults for placeholders this step doesn't supply — keeps the rendered
+		// prompt clean instead of leaving literal "{{KEY}}" strings.
+		"RUN_ISSUES_DB_CLONE":     "",
+		"REPO_CLAUDE_MD":          "",
+		"CLARIFICATION_CONTEXT":   "",
+		"CYCLE_REVIEW_OUTPUT":     "",
+		"RESTART_CONTEXT":         "",
+		"IMPLEMENTER_OUTPUT_TAIL": "",
+	}
+}
+
+// issueBodyText is the value substituted into {{ISSUE_BODY}}: title on the
+// first line then a blank line then the body, mirroring what a GitHub issue
+// renders. If only the body is set it's used as-is.
+func issueBodyText(title, body string) string {
+	title = strings.TrimSpace(title)
+	body = strings.TrimRight(body, "\n")
+	switch {
+	case title == "" && body == "":
+		return ""
+	case title == "":
+		return body
+	case body == "":
+		return "# " + title
+	}
+	return "# " + title + "\n\n" + body
+}
+
+// renderComments produces the human-readable block for {{ISSUE_COMMENTS}}.
+// Each non-bot comment becomes a labelled section; an empty list yields a
+// short Finnish "no comments" notice so the rendered prompt section isn't
+// blank.
+func renderComments(cs []IssueComment) string {
+	if len(cs) == 0 {
+		return "_Ei kommentteja._"
+	}
+	var b strings.Builder
+	for i, c := range cs {
+		if i > 0 {
+			b.WriteString("\n\n---\n\n")
+		}
+		author := strings.TrimSpace(c.Author)
+		if author == "" {
+			author = "(tuntematon)"
+		}
+		fmt.Fprintf(&b, "**@%s:**\n\n%s", author, strings.TrimRight(c.Body, "\n"))
+	}
+	return b.String()
+}
+
+// renderImages produces the {{ISSUE_IMAGES}} block. Successful downloads point
+// at their worktree-relative path so the agent can Read them directly; failed
+// downloads list the URL so the agent at least knows what was referenced.
+func renderImages(wt string, results []issue.DownloadResult, fallbackURLs []string) string {
+	if len(results) == 0 && len(fallbackURLs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## Issue-kuvat\n\n")
+	if len(results) == 0 {
+		// Image-extraction listed URLs but none were downloaded (e.g. mkdir
+		// failed); fall back to URL-only refs.
+		b.WriteString("Linkit (lataus epäonnistui — käytä URL:ää suoraan):\n")
+		for _, u := range fallbackURLs {
+			fmt.Fprintf(&b, "- %s\n", u)
+		}
+		return strings.TrimRight(b.String(), "\n")
+	}
+	fmt.Fprintf(&b, "Ladattu hakemistoon `%s/`:\n", issueImagesSubdir)
+	for _, r := range results {
+		if r.Err == nil {
+			rel := r.Path
+			if r := strings.TrimPrefix(rel, wt+string(filepath.Separator)); r != rel {
+				rel = r
+			}
+			fmt.Fprintf(&b, "- `%s` (alkuperä: %s)\n", rel, r.URL)
+		} else {
+			fmt.Fprintf(&b, "- **lataus epäonnistui:** %s (%v)\n", r.URL, r.Err)
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
