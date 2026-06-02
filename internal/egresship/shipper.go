@@ -74,6 +74,10 @@ func Run(ctx context.Context, cfg Config) error {
 	resetFlushTimer(flushTimer, cfg.FlushInterval)
 
 	flush := func() {
+		// Always re-arm the timer, even on an empty flush — otherwise a single
+		// idle interval drains flushTimer.C and the next low-traffic entry sits
+		// in buf until BatchSize is reached.
+		defer resetFlushTimer(flushTimer, cfg.FlushInterval)
 		if len(buf) == 0 {
 			return
 		}
@@ -85,7 +89,6 @@ func Run(ctx context.Context, cfg Config) error {
 			logger.Printf("egresship: ship batch failed (%d entries): %v", len(buf), err)
 		}
 		buf = buf[:0]
-		resetFlushTimer(flushTimer, cfg.FlushInterval)
 	}
 
 	openOrReopen := func() {
