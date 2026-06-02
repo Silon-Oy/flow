@@ -140,6 +140,18 @@ func (c *Client) PatchRun(ctx context.Context, runID string, patch map[string]an
 	return err
 }
 
+// GetRun loads the full run record by id. The in-container orchestrator uses
+// this to resolve its per-run config (remote, issue number, branch) without
+// re-deriving it from the host context — the container only carries the run-id
+// (and the central URL + runner token) across the §11.1 trust boundary.
+func (c *Client) GetRun(ctx context.Context, runID string) (*runstate.Run, error) {
+	var r runstate.Run
+	if _, err := c.do(ctx, http.MethodGet, "/v1/runs/"+runID, nil, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
 // AppendEvents pushes a batch of run events.
 func (c *Client) AppendEvents(ctx context.Context, runID string, events []runstate.Event) error {
 	_, err := c.do(ctx, http.MethodPost, "/v1/runs/"+runID+"/events",

@@ -1,6 +1,11 @@
 package issue
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -95,5 +100,66 @@ func TestExtractImageURLs(t *testing.T) {
 	}
 	if len(urls2) != 0 {
 		t.Errorf("expected empty output, got %v", urls2)
+	}
+}
+
+func TestDownloadImages(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/a.png", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte("PNG-bytes-1"))
+	})
+	mux.HandleFunc("/user-attachments/assets/aaa-bbb", func(w http.ResponseWriter, r *http.Request) {
+		// GitHub user-attachments URLs have no extension — fall back to Content-Type.
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write([]byte("JPEG-bytes"))
+	})
+	mux.HandleFunc("/missing", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), ".flow", "issue-images")
+	urls := []string{
+		srv.URL + "/a.png",
+		srv.URL + "/user-attachments/assets/aaa-bbb",
+		srv.URL + "/missing",
+	}
+	results, err := DownloadImages(context.Background(), dest, urls)
+	if err != nil {
+		t.Fatalf("DownloadImages: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("results len = %d, want 3", len(results))
+	}
+	// 00.png — URL-derived extension wins.
+	if filepath.Base(results[0].Path) != "00.png" {
+		t.Errorf("results[0].Path = %s, want 00.png", results[0].Path)
+	}
+	b, err := os.ReadFile(results[0].Path)
+	if err != nil || string(b) != "PNG-bytes-1" {
+		t.Errorf("a.png content mismatch: %v / %q", err, b)
+	}
+	// 01.jpg — Content-Type fallback for extension-less URLs.
+	if filepath.Base(results[1].Path) != "01.jpg" {
+		t.Errorf("results[1].Path = %s, want 01.jpg", results[1].Path)
+	}
+	// Failures are per-URL: Err set, Path empty, batch did NOT abort.
+	if results[2].Err == nil || !strings.Contains(results[2].Err.Error(), "404") {
+		t.Errorf("results[2].Err = %v, want 404", results[2].Err)
+	}
+	if results[2].Path != "" {
+		t.Errorf("failed download must not have a path, got %s", results[2].Path)
+	}
+}
+
+func TestDownloadImagesNoURLs(t *testing.T) {
+	res, err := DownloadImages(context.Background(), filepath.Join(t.TempDir(), "nope"), nil)
+	if err != nil {
+		t.Fatalf("empty input must not error: %v", err)
+	}
+	if res != nil {
+		t.Errorf("empty input must return nil, got %v", res)
 	}
 }

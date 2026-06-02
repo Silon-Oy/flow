@@ -14,6 +14,8 @@ func TestDockerArgsHardening(t *testing.T) {
 		RunID:              "20260602-rid-1",
 		WorktreePath:       "/srv/flow/work/run-1",
 		RunnerName:         "studio",
+		CentralURL:         "http://flowd:8080",
+		CentralToken:       "runner-token-abc",
 		ClaudeCredHostPath: "/srv/flow/creds/claude.json",
 		MemoryLimit:        "2g",
 		CPULimit:           "2",
@@ -34,6 +36,9 @@ func TestDockerArgsHardening(t *testing.T) {
 		"--pids-limit=512",
 		"-v /srv/flow/work/run-1:/work",
 		"HTTPS_PROXY=http://egress-proxy:3128",
+		// Central-service callback envs (NOT GitHub credentials — §11.3 OK).
+		"FLOW_CENTRAL_URL=http://flowd:8080",
+		"FLOW_RUNNER_TOKEN=runner-token-abc",
 		// Claude credential as a read-only FILE mount (Model B), not env.
 		"-v /srv/flow/creds/claude.json:/run/claude-credentials.json:ro",
 	}
