@@ -63,12 +63,20 @@ type Reporter interface {
 // Config carries the per-run inputs resolved from the lease + project config.
 type Config struct {
 	RunID       string
-	RepoRoot    string // the runner's clone (mounted at /work in the container)
+	RepoRoot    string // the runner's clone (host path used to create the worktree)
 	Remote      string
 	Branch      string // auto-run/<remote_label>-<slug>
 	BaseBranch  string // optional integration branch
 	IssueNumber int
 	IssuePrompt string // pre-rendered issue context for the agents
+
+	// WorktreePath, when non-empty, is the already-populated worktree directory
+	// the orchestrator should use as-is (skips S4 worktree.Create). This is the
+	// container-mode path: the host creates the worktree at run time and mounts
+	// it as /work; the in-container orchestrator gets /work here so it does not
+	// try to git-worktree-add from inside a single mount. In in-process mode the
+	// field stays empty and the orchestrator creates the worktree itself.
+	WorktreePath string
 
 	// AutoMode skips the interactive review gate (RUN_ISSUES_AUTO=1 equivalent).
 	AutoMode bool
@@ -103,11 +111,20 @@ type Outcome struct {
 func (o *Orchestrator) Run(ctx context.Context, git GitOps) (Outcome, error) {
 	out := Outcome{Branch: o.cfg.Branch, LastStep: StepLeaseHeld}
 
-	// S4: worktree.
+	// S4: worktree. In container mode the host has already created and mounted
+	// the worktree (so the orchestrator sees a populated dir under a single mount
+	// — `git worktree add` from inside that mount cannot work). The host hands the
+	// path through Config.WorktreePath; we record S4 and use it as-is.
 	o.setState(ctx, StepWorktree)
-	wt, err := worktree.Create(o.cfg.RepoRoot, o.cfg.RunID, o.cfg.Branch, o.cfg.BaseBranch, o.cfg.Remote)
-	if err != nil {
-		return o.fail(ctx, out, StepWorktree, "blocked", "worktree_create_failed: "+err.Error())
+	var wt string
+	if o.cfg.WorktreePath != "" {
+		wt = o.cfg.WorktreePath
+	} else {
+		created, err := worktree.Create(o.cfg.RepoRoot, o.cfg.RunID, o.cfg.Branch, o.cfg.BaseBranch, o.cfg.Remote)
+		if err != nil {
+			return o.fail(ctx, out, StepWorktree, "blocked", "worktree_create_failed: "+err.Error())
+		}
+		wt = created
 	}
 	out.LastStep = StepWorktree
 

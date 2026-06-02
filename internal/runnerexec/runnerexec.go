@@ -28,6 +28,14 @@ type Spec struct {
 	RunnerName   string // selects the per-runner egress network
 	EgressProxy  string // e.g. http://egress-proxy:3128
 
+	// Central-service callback envs. These are how the in-container orchestrator
+	// reaches flowd to fetch its run config + push telemetry; both ride out via
+	// the egress proxy. CentralToken is the flowd-issued runner token (lease-
+	// scoped on the server) — NOT a GitHub token, so it does NOT violate §11.3
+	// (which forbids GITHUB_TOKEN/GH_TOKEN crossing the trust boundary).
+	CentralURL   string
+	CentralToken string
+
 	// Claude credential file on the host, mounted READ-ONLY (Model B, §11.5).
 	// The container stages it into $HOME/.claude/.credentials.json itself; it is
 	// never an env var and never crosses to the central service.
@@ -73,10 +81,22 @@ func (s Spec) DockerArgs() []string {
 		fmt.Sprintf("--pids-limit=%d", pids),
 		// The ONLY host mount: the per-run worktree.
 		"-v", s.WorktreePath + ":/work",
-		// Egress goes through the proxy; the token is injected proxy-side (§11.3),
-		// so HTTPS_PROXY is the only network env the container sees.
+		// Egress goes through the proxy; the GitHub token is injected proxy-side
+		// (§11.3), so HTTPS_PROXY is the only network env the container sees for
+		// the GitHub path.
 		"-e", "HTTPS_PROXY=" + proxy,
 		"-e", "HTTP_PROXY=" + proxy,
+	}
+
+	// Central-service callback (flowd URL + runner token). This is the only path
+	// by which the in-container orchestrator can fetch its run config + push
+	// telemetry. The token is flowd-issued (lease-scoped), not GitHub — §11.3
+	// remains satisfied (asserted by the test).
+	if s.CentralURL != "" {
+		args = append(args, "-e", "FLOW_CENTRAL_URL="+s.CentralURL)
+	}
+	if s.CentralToken != "" {
+		args = append(args, "-e", "FLOW_RUNNER_TOKEN="+s.CentralToken)
 	}
 
 	// Claude credential as a read-only file mount (Model B). The credential is a
