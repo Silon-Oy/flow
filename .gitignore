@@ -16,3 +16,11 @@
 
 # Postgres data (when running compose locally)
 deploy/pgdata/
+
+# >>> /run-issues orchestrator runtime state (managed — do not edit) >>>
+# Per-run artefacts (logs, prompts, JSON state) and git worktrees created
+# by the /run-issues orchestrator. Auto-maintained — never version-controlled.
+.claude/run-issues/
+.claude/run-issues-archive/
+.claude/worktrees/
+# <<< /run-issues orchestrator runtime state <<<
