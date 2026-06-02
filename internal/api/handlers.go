@@ -326,6 +326,66 @@ func (s *Server) handleRunsList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"runs": out})
 }
 
+// --- egress log ------------------------------------------------------------
+
+// egressIngestReq is the runner-side wire shape the shipper posts. Each entry
+// carries host + allowed + ts only — never content, bytes, or credentials
+// (§11.6 invariant). lease_id / run_id are NOT populated by the runner: squid
+// does not know which lease originated a request, so the bootstrap tenant is
+// stamped here and lease/run linkage is deferred to Vaihe 2 (per-run sidecar
+// proxies).
+type egressIngestReq struct {
+	Entries []egressIngestEntry `json:"entries"`
+}
+
+type egressIngestEntry struct {
+	Host    string    `json:"host"`
+	Allowed bool      `json:"allowed"`
+	TS      time.Time `json:"ts"`
+}
+
+func (s *Server) handleEgressIngest(w http.ResponseWriter, r *http.Request) {
+	var req egressIngestReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if len(req.Entries) == 0 {
+		writeJSON(w, http.StatusAccepted, map[string]int{"accepted": 0})
+		return
+	}
+	ctx, cancel := withTimeout(r, 10*time.Second)
+	defer cancel()
+
+	// Build the bulk insert via UNNEST — one round-trip regardless of batch size.
+	hosts := make([]string, len(req.Entries))
+	allowed := make([]bool, len(req.Entries))
+	tss := make([]time.Time, len(req.Entries))
+	for i, e := range req.Entries {
+		if e.Host == "" {
+			writeErr(w, http.StatusBadRequest, "entry host required")
+			return
+		}
+		hosts[i] = e.Host
+		allowed[i] = e.Allowed
+		if e.TS.IsZero() {
+			tss[i] = time.Now().UTC()
+		} else {
+			tss[i] = e.TS
+		}
+	}
+	_, err := s.Pool.Exec(ctx, `
+		INSERT INTO egress_log (tenant_id, host, allowed, ts)
+		SELECT $1, h, a, t
+		  FROM UNNEST($2::text[], $3::boolean[], $4::timestamptz[]) AS u(h, a, t)`,
+		s.TenantID, hosts, allowed, tss)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "egress ingest: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]int{"accepted": len(req.Entries)})
+}
+
 func (s *Server) handleEgressList(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()

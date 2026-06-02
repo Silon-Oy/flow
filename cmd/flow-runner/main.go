@@ -16,6 +16,7 @@ import (
 
 	"github.com/Silon-Oy/flow/internal/centralclient"
 	"github.com/Silon-Oy/flow/internal/claude"
+	"github.com/Silon-Oy/flow/internal/egresship"
 	"github.com/Silon-Oy/flow/internal/lease"
 	"github.com/Silon-Oy/flow/internal/orchestrator"
 )
@@ -50,6 +51,20 @@ func main() {
 	log.Printf("flow-runner: registered as %s (host %s)", runnerID, hostname)
 
 	go runnerHeartbeat(ctx, cli, runnerID)
+
+	// §11.6: tail the egress-proxy's squid access.log and ship host-level
+	// entries to flowd. The log path is opt-in (empty = disabled) so dev boxes
+	// without the egress-proxy sidecar still boot.
+	if logPath := os.Getenv("FLOW_EGRESS_LOG"); logPath != "" {
+		go func() {
+			if err := egresship.Run(ctx, egresship.Config{
+				Path: logPath,
+				Sink: egresship.CentralSink{Client: cli},
+			}); err != nil {
+				log.Printf("flow-runner: egress shipper exited: %v", err)
+			}
+		}()
+	}
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()

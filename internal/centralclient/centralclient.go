@@ -147,6 +147,27 @@ func (c *Client) AppendEvents(ctx context.Context, runID string, events []runsta
 	return err
 }
 
+// EgressEntry is the wire shape POST /v1/egress accepts. It mirrors
+// egresship.Entry but lives here so the runner can call ShipEgress without
+// pulling the api/egresship packages into a tight import loop.
+type EgressEntry struct {
+	Host    string    `json:"host"`
+	Allowed bool      `json:"allowed"`
+	TS      time.Time `json:"ts"`
+}
+
+// ShipEgress posts a batch of squid access-log entries to flowd. The central
+// stamps tenant_id; lease/run linkage is left for a later phase (squid does
+// not know which lease originated a request — §11.6 minimum-acceptable).
+func (c *Client) ShipEgress(ctx context.Context, entries []EgressEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	_, err := c.do(ctx, http.MethodPost, "/v1/egress",
+		map[string]any{"entries": entries}, nil)
+	return err
+}
+
 // RunView is the subset of a run the CLI status command shows.
 type RunView struct {
 	ID           string  `json:"id"`

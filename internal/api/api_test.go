@@ -195,6 +195,56 @@ func TestFullRunnerWorkflow(t *testing.T) {
 	}
 }
 
+// TestEgressIngestAndList exercises the §11.6 shipper wire contract end-to-end:
+// POST /v1/egress accepts a batch, the rows land on the bootstrap tenant, and
+// GET /v1/egress surfaces them (allowed + denied) for the dashboard.
+func TestEgressIngestAndList(t *testing.T) {
+	ts, _, _, _ := newTestServer(t)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	resp, data := post(t, ts.URL+"/v1/egress", map[string]any{
+		"entries": []map[string]any{
+			{"host": "github.com", "allowed": true, "ts": now.Format(time.RFC3339Nano)},
+			{"host": "evil.example.com", "allowed": false, "ts": now.Add(time.Second).Format(time.RFC3339Nano)},
+		},
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("ingest: %d %s", resp.StatusCode, data)
+	}
+	var ack struct {
+		Accepted int `json:"accepted"`
+	}
+	mustJSON(t, data, &ack)
+	if ack.Accepted != 2 {
+		t.Errorf("accepted = %d, want 2", ack.Accepted)
+	}
+
+	gr, err := http.Get(ts.URL + "/v1/egress")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var list struct {
+		Egress []struct {
+			Host    string `json:"host"`
+			Allowed bool   `json:"allowed"`
+		} `json:"egress"`
+	}
+	mustJSON(t, readBody(t, gr), &list)
+
+	var sawAllowed, sawDenied bool
+	for _, e := range list.Egress {
+		if e.Host == "github.com" && e.Allowed {
+			sawAllowed = true
+		}
+		if e.Host == "evil.example.com" && !e.Allowed {
+			sawDenied = true
+		}
+	}
+	if !sawAllowed || !sawDenied {
+		t.Errorf("list missing entries: allowed=%v denied=%v rows=%+v", sawAllowed, sawDenied, list.Egress)
+	}
+}
+
 func mustJSON(t *testing.T, data []byte, v any) {
 	t.Helper()
 	if err := json.Unmarshal(data, v); err != nil {
