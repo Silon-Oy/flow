@@ -10,7 +10,8 @@ pätevät normaalisti — älä toista niitä tässä.
   kanoninen suunnitelma. Lue relevantti pykälä ennen kuin toteutat — kaikki
   invariantit, päätökset ja portattavuus-kartta ovat siellä.
 - **Päätösloki:** §2.2. Kun teet arkkitehtuurivalinnan, kirjaa se sinne.
-- **Avoimet päätökset:** §17 / issue #15. Älä lukitse niitä koodissa kysymättä.
+- **§17:n avoimet päätökset (10–14) on ratkaistu** (issue #15 suljettu) ja
+  kirjattu päätöslokiin §2.2. Uudet arkkitehtuurivalinnat → §2.2.
 
 ## Status
 

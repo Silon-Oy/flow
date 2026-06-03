@@ -79,8 +79,10 @@ mukaan. Avoimet työt: [issue-lista](https://github.com/Silon-Oy/flow/issues).
   [#13](https://github.com/Silon-Oy/flow/issues/13), gVisor opt-in
   [#14](https://github.com/Silon-Oy/flow/issues/14).
 
-Avoimet päätökset (suunnitelma §17, ei toteutustehtäviä):
-[#15](https://github.com/Silon-Oy/flow/issues/15).
+Suunnitelman §17 avoimet päätökset (10–14) on ratkaistu ja kirjattu
+päätöslokiin §2.2 ([#15](https://github.com/Silon-Oy/flow/issues/15) suljettu).
+Seuranta-issuet: audit-loki [#21](https://github.com/Silon-Oy/flow/issues/21),
+metrics-endpoint [#22](https://github.com/Silon-Oy/flow/issues/22).
 
 ## Postgres-integraatiotestit
 
