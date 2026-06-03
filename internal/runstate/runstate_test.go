@@ -3,6 +3,7 @@ package runstate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -51,7 +52,7 @@ func TestRunLifecycleAndEvents(t *testing.T) {
 		t.Fatalf("create run: %v", err)
 	}
 
-	r, err := s.GetRun(ctx, runID)
+	r, err := s.GetRun(ctx, tenantID, runID)
 	if err != nil {
 		t.Fatalf("get run: %v", err)
 	}
@@ -63,10 +64,10 @@ func TestRunLifecycleAndEvents(t *testing.T) {
 	}
 
 	// PATCH: only branch + current_state; status untouched.
-	if err := s.PatchRun(ctx, runID, Patch{Branch: strp("auto-run/issue-42"), CurrentState: strp("S8_Implement")}); err != nil {
+	if err := s.PatchRun(ctx, tenantID, runID, Patch{Branch: strp("auto-run/issue-42"), CurrentState: strp("S8_Implement")}); err != nil {
 		t.Fatalf("patch1: %v", err)
 	}
-	r, _ = s.GetRun(ctx, runID)
+	r, _ = s.GetRun(ctx, tenantID, runID)
 	if r.Branch == nil || *r.Branch != "auto-run/issue-42" {
 		t.Errorf("branch not patched: %v", r.Branch)
 	}
@@ -76,10 +77,10 @@ func TestRunLifecycleAndEvents(t *testing.T) {
 
 	// PATCH: finalize as completed.
 	completed := StatusCompleted
-	if err := s.PatchRun(ctx, runID, Patch{Status: &completed, PRURL: strp("https://github.com/o/r/pull/1"), Finished: true}); err != nil {
+	if err := s.PatchRun(ctx, tenantID, runID, Patch{Status: &completed, PRURL: strp("https://github.com/o/r/pull/1"), Finished: true}); err != nil {
 		t.Fatalf("patch2: %v", err)
 	}
-	r, _ = s.GetRun(ctx, runID)
+	r, _ = s.GetRun(ctx, tenantID, runID)
 	if r.Status != StatusCompleted {
 		t.Errorf("status = %q, want completed", r.Status)
 	}
@@ -93,10 +94,10 @@ func TestRunLifecycleAndEvents(t *testing.T) {
 		{Event: "cycle_review_decision", Data: json.RawMessage(`{"decision":"PROCEED"}`)},
 		{Event: "implementer_result", Data: json.RawMessage(`{"result":"SUCCESS"}`)},
 	}
-	if err := s.AppendEvents(ctx, runID, events); err != nil {
+	if err := s.AppendEvents(ctx, tenantID, runID, events); err != nil {
 		t.Fatalf("append events: %v", err)
 	}
-	got, err := s.ListEvents(ctx, runID)
+	got, err := s.ListEvents(ctx, tenantID, runID)
 	if err != nil {
 		t.Fatalf("list events: %v", err)
 	}
@@ -108,7 +109,22 @@ func TestRunLifecycleAndEvents(t *testing.T) {
 	}
 
 	// Empty batch is a no-op.
-	if err := s.AppendEvents(ctx, runID, nil); err != nil {
+	if err := s.AppendEvents(ctx, tenantID, runID, nil); err != nil {
 		t.Errorf("empty batch should be no-op: %v", err)
+	}
+
+	// Cross-tenant access MUST surface ErrNotFound — existence does not leak.
+	other := "00000000-0000-0000-0000-000000000000"
+	if _, err := s.GetRun(ctx, other, runID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("cross-tenant GetRun err = %v, want ErrNotFound", err)
+	}
+	if err := s.PatchRun(ctx, other, runID, Patch{CurrentState: strp("S0")}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("cross-tenant PatchRun err = %v, want ErrNotFound", err)
+	}
+	if err := s.AppendEvents(ctx, other, runID, []Event{{Event: "noop"}}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("cross-tenant AppendEvents err = %v, want ErrNotFound", err)
+	}
+	if evs, err := s.ListEvents(ctx, other, runID); err != nil || len(evs) != 0 {
+		t.Errorf("cross-tenant ListEvents = (%d events, %v), want (0, nil)", len(evs), err)
 	}
 }

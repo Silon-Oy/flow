@@ -50,8 +50,11 @@ func (sc *Scanner) Run(ctx context.Context) {
 	}
 }
 
-// project is the subset of the project row the scanner needs.
+// project is the subset of the project row the scanner needs. tenantID is
+// loaded per-row, not derived from a global "current tenant", because the
+// scanner is system-level: it iterates every tenant on every tick (§7).
 type scanProject struct {
+	tenantID  string
 	id        string
 	ownerRepo string
 	remotes   []remoteEntry
@@ -66,9 +69,12 @@ type remoteEntry struct {
 	OwnerRepo string `json:"owner_repo"`
 }
 
-// scanOnce loads every project for the bootstrap tenant and enqueues its
-// auto-run issues as claimable work. Errors are logged, not fatal — a transient
-// GitHub failure must not crash the central service.
+// scanOnce iterates EVERY tenant's projects and enqueues their auto-run
+// issues as claimable work. The scanner is a system-level component (no HTTP
+// request, no middleware): it MUST iterate tenants explicitly so there is no
+// implicit "tenant-empty = all tenants" shortcut bypassing the §7 boundary.
+// Errors are logged, not fatal — a transient GitHub failure must not crash
+// the central service.
 func (sc *Scanner) scanOnce(ctx context.Context) {
 	projects, err := sc.loadProjects(ctx)
 	if err != nil {
@@ -101,16 +107,19 @@ func (sc *Scanner) scanOnce(ctx context.Context) {
 					continue
 				}
 				for _, is := range issues {
-					sc.enqueue(ctx, p.id, rem.Name, is.Number)
+					sc.enqueue(ctx, p.tenantID, p.id, rem.Name, is.Number)
 				}
 			}
 		}
 	}
 }
 
+// loadProjects returns every project across every tenant. The result carries
+// tenant_id per row so enqueue can stamp the correct tenant onto each work
+// row — there is no shared "current tenant" state in the scanner.
 func (sc *Scanner) loadProjects(ctx context.Context) ([]scanProject, error) {
 	rows, err := sc.srv.Pool.Query(ctx,
-		`SELECT id::text, owner_repo, remotes, labels FROM project WHERE tenant_id = $1`, sc.srv.TenantID)
+		`SELECT tenant_id::text, id::text, owner_repo, remotes, labels FROM project`)
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +128,7 @@ func (sc *Scanner) loadProjects(ctx context.Context) ([]scanProject, error) {
 	for rows.Next() {
 		var p scanProject
 		var remotesRaw, labelsRaw []byte
-		if err := rows.Scan(&p.id, &p.ownerRepo, &remotesRaw, &labelsRaw); err != nil {
+		if err := rows.Scan(&p.tenantID, &p.id, &p.ownerRepo, &remotesRaw, &labelsRaw); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(remotesRaw, &p.remotes)
@@ -129,16 +138,16 @@ func (sc *Scanner) loadProjects(ctx context.Context) ([]scanProject, error) {
 	return out, rows.Err()
 }
 
-// enqueue upserts a develop-kind work row. ON CONFLICT (work_key) DO NOTHING
-// makes re-scanning idempotent: an issue already queued (and possibly leased)
-// is not re-inserted.
-func (sc *Scanner) enqueue(ctx context.Context, projectID, remote string, issue int) {
-	wk := WorkKey(sc.srv.TenantID, projectID, remote, issue, "develop")
+// enqueue upserts a develop-kind work row stamped with the project's own
+// tenant. ON CONFLICT (work_key) DO NOTHING makes re-scanning idempotent: an
+// issue already queued (and possibly leased) is not re-inserted.
+func (sc *Scanner) enqueue(ctx context.Context, tenantID, projectID, remote string, issue int) {
+	wk := WorkKey(tenantID, projectID, remote, issue, "develop")
 	_, err := sc.srv.Pool.Exec(ctx, `
 		INSERT INTO claimable_work (tenant_id, project_id, work_key, remote, issue_number, kind)
 		VALUES ($1, $2, $3, $4, $5, 'develop')
 		ON CONFLICT (work_key) DO NOTHING`,
-		sc.srv.TenantID, projectID, wk, remote, issue)
+		tenantID, projectID, wk, remote, issue)
 	if err != nil {
 		log.Printf("scanner: enqueue %s: %v", wk, err)
 	}

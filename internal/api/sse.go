@@ -65,6 +65,16 @@ func (h *logHub) publish(runID string, events []runstate.Event) {
 // live events. Uses http.Flusher directly (no SSE library, per §6).
 func (s *Server) handleRunLogs(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
+	tenantID := tenantFromCtx(r.Context())
+
+	// Verify the run belongs to the caller's tenant BEFORE opening the stream:
+	// otherwise a cross-tenant runID would yield an empty backlog and an open
+	// SSE channel. Returning 404 here keeps existence from leaking and prevents
+	// a tenant from latching onto another tenant's runID via the hub.
+	if _, err := s.Runs.GetRun(r.Context(), tenantID, runID); err != nil {
+		writeErr(w, http.StatusNotFound, "unknown run")
+		return
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -81,7 +91,7 @@ func (s *Server) handleRunLogs(w http.ResponseWriter, r *http.Request) {
 	ch := s.hub.subscribe(runID)
 	defer s.hub.unsubscribe(runID, ch)
 
-	backlog, err := s.Runs.ListEvents(r.Context(), runID)
+	backlog, err := s.Runs.ListEvents(r.Context(), tenantID, runID)
 	if err == nil {
 		for _, e := range backlog {
 			writeSSE(w, e)
