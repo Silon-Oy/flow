@@ -223,3 +223,46 @@ func (c *Client) ListRunners(ctx context.Context) ([]RunnerView, error) {
 	_, err := c.do(ctx, http.MethodGet, "/v1/runners", nil, &out)
 	return out.Runners, err
 }
+
+// --- §7(a) human auth — GitHub OAuth device flow ----------------------------
+
+// DeviceStart mirrors the central's POST /v1/auth/device/start response. The
+// CLI shows VerificationURI + UserCode to the user and polls every Interval.
+type DeviceStart struct {
+	DeviceCode      string `json:"device_code"`
+	UserCode        string `json:"user_code"`
+	VerificationURI string `json:"verification_uri"`
+	ExpiresIn       int    `json:"expires_in"`
+	Interval        int    `json:"interval"`
+}
+
+// StartDeviceLogin asks the central to begin a device-flow login. The returned
+// DeviceCode must be passed back to PollDeviceLogin; GitHub already binds it to
+// the user_code shown in the browser.
+func (c *Client) StartDeviceLogin(ctx context.Context) (*DeviceStart, error) {
+	var out DeviceStart
+	if _, err := c.do(ctx, http.MethodPost, "/v1/auth/device/start", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DevicePoll mirrors the central's POST /v1/auth/device/poll response. Exactly
+// one of (Pending, SessionToken) is meaningful per call.
+type DevicePoll struct {
+	Pending      bool      `json:"pending"`
+	SessionToken string    `json:"session_token,omitempty"`
+	GitHubLogin  string    `json:"github_login,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at,omitempty"`
+}
+
+// PollDeviceLogin polls the central once. Pending=true means "keep polling".
+// SessionToken!="" means success — the CLI writes it to the credentials file.
+func (c *Client) PollDeviceLogin(ctx context.Context, deviceCode string) (*DevicePoll, error) {
+	var out DevicePoll
+	if _, err := c.do(ctx, http.MethodPost, "/v1/auth/device/poll",
+		map[string]string{"device_code": deviceCode}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
