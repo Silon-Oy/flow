@@ -41,6 +41,11 @@ Flow ratkaisee tämän **hybridimallilla**: GitHub pysyy issue/PR-totuuden läht
 | 7 | Admin-näkyvyys | **Metadata + lokit** | Status/kesto/vaihe/retry/linkit + ajolokit. EI agentin täysiä promptteja/diffejä dashboardissa. |
 | 8 | Roolit | **admin + developer** | Developer: rekisteröi projekteja, näkee omat ajot. Admin: koko tenant + runner/secret/merge-policy-hallinta. |
 | 9 | Runner-eristys | **Taso 1 MVP:hen, Taso 2 roadmapille** | Taso 1 = kovennettu Docker + egress-allow-list + credentials-proxy + scoped git-write. Taso 2 = gVisor (opt-in). |
+| 10 | Kaupallisuus | **Sisäinen, commercial-ready** | Silonin sisäinen tiimityökalu nyt. Multi-tenant-skeema (päätös 5) säilyy, mutta ei billingiä/SLA:ta/Malli A:ta — kaupallistaminen mahdollista myöhemmin ilman tietomallin uudelleenkirjoitusta. Luottamusmalli: runnerit ajavat *Silonin omaa* koodia → ei untrusted-tenantteja jaetulla runnerilla MVP:ssä. (Avoin kysymys §17 / #15 ratkaistu.) |
+| 11 | R4(2) Claude-auth kontissa | **Malli B; Malli A lykätty roadmap-optioksi** | Credentiaali tiedostona kontissa (§11.5, todennettu §12). Per-kone plan-billing rajaa vahingon koneen kiintiöön, ei tenant-dataan. Malli A (TLS-MITM, credentiaali pois kontista) revisioidaan **vain jos** jaettu untrusted-tenant-runner asiakkaille toteutuu — silloin se kytkeytyy päätöksen 10 uudelleenarviointiin. (§17 / #15 ratkaistu.) |
+| 12 | R3c scoped git-write | **GitHub App -scope + branch protection ensisijaisesti** | Branch protection (vaadi PR mainiin, estä force-push + haaran poisto suojatuilla haaroilla) + App-tokenin permission-scope = robusti GitHub-natiivi vahvistus. Proxy tekee vain karkean write/read-tarkistuksen (§11.3 MITM:ää github.comin jo credentials-injektiota varten). Hauras pkt-line-ref-parsinta (§11.4) **lykätty roadmapille** (Taso 2 / defense-in-depth) — toteutetaan vain jos jaettu untrusted-runner sitä vaatii. (§17 / #15 ratkaistu.) |
+| 13 | Observability & backup | **Kevyt Prometheus + audit Vaihe 2; pg_dump-backup #13** | (a) Prometheus-`/metrics`-endpoint `flowd`:lle (counterit: ajot statuksittain, lease-myönnöt, skanneri-pollit, egress-denied). OTel-distributed-tracing lykätty roadmapille. Eksplisiittinen append-only audit-loki (kuka muutti merge-policyä/rekisteröi projektin/myönsi runner-tokenin) **Vaihe 2:een** (vaatii roolit, #21). Metrics-endpoint = #22. (b) Postgres-backup = ajastettu `pg_dump` + retention + offsite-kopio, dokumentoitu Vaihe 4 deploy-paketointiin (#13). Egress- (§11.6) + RUN_EVENT-lokit kattavat loput. (§17 / #15 ratkaistu.) |
+| 14 | base_branch-skooppi | **Projektitaso default + per-remote override** | `PROJECT.base_branch` = oletus; `remotes`-jsonb saa valinnaisen per-remote `base_branch`-overriden (eri orgit voivat käyttää eri integraatiohaaraa). Ei migraatiota (remotes on jo jsonb), override valinnainen → yhden-haaran tapaus pysyy yksinkertaisena. Resolvointi: remote-override ?? project.base_branch. (§17 / #15 ratkaistu.) |
 
 ---
 
@@ -164,6 +169,7 @@ erDiagram
     USER }o--|| ROLE : assigned
 
     PROJECT { uuid id PK; uuid tenant_id FK; text name; text owner_repo; jsonb remotes; jsonb labels; text base_branch; uuid runner_pool FK; jsonb secret_refs; jsonb merge_policy; jsonb claude_config }
+    %% remotes jsonb: [{remote, base_branch?}] — per-remote base_branch override, fallback PROJECT.base_branch (päätös 14)
     RUNNER { uuid id PK; uuid tenant_id FK; text hostname; int capacity; int active_leases; timestamptz last_heartbeat; text status; jsonb capabilities }
     CLAIMABLE_WORK { uuid id PK; uuid project_id FK; text work_key UK; text remote; int issue_number; text kind; timestamptz created_at }
     LEASE { uuid id PK; text work_key FK; uuid runner_id FK; text status; timestamptz acquired_at; timestamptz expires_at }
@@ -232,9 +238,9 @@ Tenant-eristys middlewaressa (ei sovelluskoodin varassa). Cross-tenant super-adm
 |---|---|---|
 | `name` | (uusi) | uniikki per tenant |
 | `owner_repo` | gh-cwd | regex + App-installaation olemassaolo |
-| `remotes[]` | watchlist | resolvoituu owner/repoksi |
+| `remotes[]` | watchlist | resolvoituu owner/repoksi; objekti `{remote, base_branch?}` (päätös 14) |
 | `labels[]` | watchlist (oletus `auto-run`) | — |
-| `base_branch` | run-issues.json | branch olemassa (App-token) |
+| `base_branch` | run-issues.json | branch olemassa (App-token); **projektitason default** — per-remote override resolvoituu `remotes[].base_branch ?? base_branch` (päätös 14) |
 | `runner_pool` | hostname-hardkoodaus (poistuu) | pool olemassa + oikeus |
 | `claude_timeout_seconds` | run-issues.json | positiivinen int |
 | `merge_policy` | PR_WATCH_MERGE_LABEL + conflict-flag | enum/bool |
@@ -308,12 +314,14 @@ flowd (token broker) ──(2) tenant-scoped token──► flow-runner
 ```
 Raaka credentiaali ei koskaan ylitä luottamusrajaa konttiin. Prompt-injektio voi ajaa mitä tahansa kontissa, mutta `cat $TOKEN` ei tuota mitään.
 
-### 11.4 Scoped git-write
-Proxy parsii git-smart-HTTP `git-receive-pack`-operaatiot: sallii `auto-run/*`, estää non-fast-forward suojattuihin haaroihin + haaran poiston. **Toteutusvaihtoehto (R3c):** jos pkt-line-parsinta osoittautuu hauraaksi, nojaa ensisijaisesti GitHub App -permission-scopeen + branch protectioniin.
+### 11.4 Scoped git-write (R3c — päätös 12)
+**Ensisijainen vahvistus (MVP): GitHub App -permission-scope + branch protection.** Branch protection suojatuilla haaroilla (main): vaadi PR, estä force-push + haaran poisto. App-token rajaa write-oikeudet konfiguroituihin repoihin. Proxy tekee vain **karkean** tarkistuksen — se MITM:ää `github.com`:n jo credentials-injektiota varten (§11.3), joten se erottaa halvalla `git-receive-pack` (write) vs. `git-upload-pack` (read) ja kohde-repon.
+
+**Lykätty roadmapille (Taso 2 / defense-in-depth):** proxy parsii git-smart-HTTP `git-receive-pack`-operaatiot pkt-line-tasolla: sallii vain `auto-run/*`, estää non-fast-forwardin suojattuihin haaroihin. EI MVP:ssä, koska pkt-line-parsinta on hauras (git protocol v2 voi rikkoa) eikä sisäinen luottamusmalli (päätös 10) sitä vaadi. Toteutetaan vain jos jaettu untrusted-tenant-runner sitä edellyttää.
 
 ### 11.5 Claude-auth kontissa (kytkös R4)
-- **Malli A:** proxy injektoi Claude-credentiaalin (vaatii TLS-MITM api.anthropic.com:lle). Ideaali, credentiaali pois kontista. **Lykätty.**
-- **Malli B (MVP, hyväksytty):** Claude-auth elää kontissa tiedostona. Per-kone plan-billing rajaa vahingon koneen kiintiöön (ei tenant-dataan). **Todennettu R4-kokeella (§12).**
+- **Malli A:** proxy injektoi Claude-credentiaalin (vaatii TLS-MITM api.anthropic.com:lle). Ideaali, credentiaali pois kontista. **Lykätty roadmap-optioksi (päätös 11)** — revisioidaan vain jos jaettu untrusted-tenant-runner asiakkaille toteutuu.
+- **Malli B (MVP, valittu — päätös 11):** Claude-auth elää kontissa tiedostona. Per-kone plan-billing rajaa vahingon koneen kiintiöön (ei tenant-dataan). **Todennettu R4-kokeella (§12).**
 
 ### 11.6 Egress-lokit → dashboard (päätös 7)
 Proxy lokittaa `{lease_id, tenant_id, run_id, host, allowed|denied, ts}` (EI sisältöä/credentiaalia) → admin näkee mihin runnerit ottivat yhteyttä. Denied-yhteydet = kiertoyritys-signaali.
@@ -403,10 +411,10 @@ flow/
 
 - **Vaihe 0 — Diagnostinen pohja.** PORT-funktiot Goon testeineen + Postgres-skeema + `flowd` käynnistyy tyhjänä. Riskitön.
 - **Vaihe 0.5 — R4-koe.** ✅ **TEHTY** (§12). Estävä portti läpäisty.
-- **Vaihe 1 — MVP tiimikäyttöön.** Keskitetty lease (§5) + Run/RunEvent-API + skanneri + `flow-runner` (S1–S12 REWRITE) per-ajo **kovennettu kontti + egress/credentials-proxy** (§11) + `flowctl status` + read-only dashboard (sis. egress-lokit). Single-tenant datassa, `tenant_id` skeemassa valmiina. **Arvo:** kaksi devaajaa eri gh-loginilla ajavat ilman tuplatyötä (lease) JA untrusted-koodi ajetaan eristyksessä (credentiaalit eivät vuoda).
-- **Vaihe 2 — Multi-tenancy + RBAC + auth.** Tenant-eristysmiddleware, OAuth device flow, runner-token, roolit, per-tenant App-rekisteri (ei-origin-bypass poistuu).
+- **Vaihe 1 — MVP tiimikäyttöön.** Keskitetty lease (§5) + Run/RunEvent-API + skanneri + `flow-runner` (S1–S12 REWRITE) per-ajo **kovennettu kontti + egress/credentials-proxy** (§11) + `flowctl status` + read-only dashboard (sis. egress-lokit) + kevyt Prometheus-`/metrics`-endpoint `flowd`:lle (päätös 13, #22). Single-tenant datassa, `tenant_id` skeemassa valmiina. **Arvo:** kaksi devaajaa eri gh-loginilla ajavat ilman tuplatyötä (lease) JA untrusted-koodi ajetaan eristyksessä (credentiaalit eivät vuoda).
+- **Vaihe 2 — Multi-tenancy + RBAC + auth.** Tenant-eristysmiddleware, OAuth device flow, runner-token, roolit, per-tenant App-rekisteri (ei-origin-bypass poistuu) + **append-only audit-loki** (päätös 13, #21: kuka muutti merge-policyä/rekisteröi projektin/myönsi runner-tokenin — vaatii roolit).
 - **Vaihe 3 — Wizard + secrets-broker + per-projekti-konfiguraatio.** `flowctl init` (§8), secret broker (§9, delivery proxy/env), admin-dashboard (runner/secret/merge-policy).
-- **Vaihe 4 — PR-watch + viimeistely + Taso 2.** `internal/prwatch` P1–P9 + AI-konfliktinratkaisu, Docker-deploy-paketointi, Tailscale-dokumentaatio, SSE live-tail, **gVisor opt-in** (Taso 2).
+- **Vaihe 4 — PR-watch + viimeistely + Taso 2.** `internal/prwatch` P1–P9 + AI-konfliktinratkaisu, Docker-deploy-paketointi (sis. **`pg_dump`-backup + retention + offsite**, päätös 13), Tailscale-dokumentaatio, SSE live-tail, **gVisor opt-in** (Taso 2), pkt-line-proxy-parsinta (päätös 12, jos tarpeen), OTel-tracing (päätös 13, jos tarpeen).
 
 ---
 
@@ -416,19 +424,22 @@ flow/
 |---|---|---|
 | R1 | Keskus = uuden työn pullonkaula (fail-closed) | Kevyt Go+Postgres, Docker restart=always, Tailscale-sisäinen. Käynnissä oleva työ ei nojaa keskukseen silmukassa (testattava invariantti). |
 | R2 | GitHub rate-limit multi-tenantissa | Vain keskus pollaa GitHubia; per-org App = oma 15k/h-kiintiö; skanneri-väli konfiguroitava. Webhook-pickup = myöhempi optio. |
-| R3 | Untrusted-tenant-koodi jaetulla runnerilla | **Ratkaistu (§11):** credentiaali pois kontista + egress default-deny + scoped write. Jäännös: R3a egress-ohitus (testattava: `curl example.com` ei läpäise), R3b DNS-rebinding (DNS proxyn kautta), R3c git-write-parsinta (vaihtoehto: App-scope+branch protection), R3e resurssi-DoS (`--memory/--pids-limit`). |
-| R4 | Claude-auth Dockerissa | **Ratkaistu (§12).** Malli B hyväksytty. R4(2) lykätty. |
+| R3 | Untrusted-tenant-koodi jaetulla runnerilla | **Ratkaistu (§11):** credentiaali pois kontista + egress default-deny + scoped write. Jäännös: R3a egress-ohitus (testattava: `curl example.com` ei läpäise), R3b DNS-rebinding (DNS proxyn kautta), R3c git-write (päätös 12: App-scope + branch protection; pkt-line-parsinta lykätty), R3e resurssi-DoS (`--memory/--pids-limit`). |
+| R4 | Claude-auth Dockerissa | **Ratkaistu (§12).** Malli B hyväksytty (päätös 11). R4(2)/Malli A lykätty roadmap-optioksi. |
 | R5 | Lease-reaping split-brain | TTL 15min ≫ heartbeat 60s; lease varmistetaan ennen PR-luontia. |
 | R6 | ghclient: go-github vs. gh-shell-out | go-github keskuksen skannerille, gh-shell-out runnerin git-operaatioille. |
 
 ---
 
 ## 17. Avoimet kysymykset (myöhempiin päätöksiin)
-- **Kaupallisuus:** onko Flow myös asiakkaille myytävä tuote (billing/SLA/eristystakuut) vai Silonin sisäinen? Vaikuttaa multi-tenancyn syvyyteen.
-- **R4(2):** halutaanko Claude-credentiaali pois kontista (malli A, TLS-MITM) vai riittääkö malli B?
-- **R3c:** scoped git-write proxy-parsinnalla vai GitHub App -scopella?
-- **Audit-loki & observability:** metrics/tracing keskukseen, Postgres-backup-strategia.
-- **base_branch per remote:** jos eri orgeissa tarvitaan eri integraatiohaara.
+
+> **Status:** kaikki viisi ratkaistu 2026-06-03 (issue #15). Päätökset kirjattu päätöslokiin §2.2 (päätökset 10–14). Säilytetään tässä jäljitettävyyden vuoksi.
+
+- ~~**Kaupallisuus:** onko Flow myös asiakkaille myytävä tuote (billing/SLA/eristystakuut) vai Silonin sisäinen?~~ → **RATKAISTU** (päätös 10): sisäinen, commercial-ready. Luottamusmalli MVP:ssä = Silonin oma koodi, ei untrusted-tenantteja jaetulla runnerilla.
+- ~~**R4(2):** halutaanko Claude-credentiaali pois kontista (malli A, TLS-MITM) vai riittääkö malli B?~~ → **RATKAISTU** (päätös 11): Malli B; Malli A lykätty roadmap-optioksi (vain jaettu untrusted-tenant-runner laukaisisi sen).
+- ~~**R3c:** scoped git-write proxy-parsinnalla vai GitHub App -scopella?~~ → **RATKAISTU** (päätös 12): App-scope + branch protection ensisijaisesti; pkt-line-proxy-parsinta lykätty roadmapille (Taso 2).
+- ~~**Audit-loki & observability:** metrics/tracing keskukseen, Postgres-backup-strategia.~~ → **RATKAISTU** (päätös 13): kevyt Prometheus-`/metrics`; audit-loki Vaihe 2:een; OTel-tracing roadmapille; `pg_dump`-backup dokumentoituna #13:ssa.
+- ~~**base_branch per remote:** jos eri orgeissa tarvitaan eri integraatiohaara.~~ → **RATKAISTU** (päätös 14): projektitaso default + valinnainen per-remote override `remotes`-jsonb:ssä. Ei migraatiota.
 
 ---
 
