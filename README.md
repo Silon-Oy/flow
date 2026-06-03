@@ -67,7 +67,8 @@ mukaan. Avoimet työt: [issue-lista](https://github.com/Silon-Oy/flow/issues).
   [#5](https://github.com/Silon-Oy/flow/issues/5), runner-token
   [#6](https://github.com/Silon-Oy/flow/issues/6), roolit
   [#7](https://github.com/Silon-Oy/flow/issues/7), App-broker
-  [#8](https://github.com/Silon-Oy/flow/issues/8).
+  [#8](https://github.com/Silon-Oy/flow/issues/8), audit-loki
+  [#21](https://github.com/Silon-Oy/flow/issues/21).
 - **Vaihe 3 — Wizard + secrets-broker** →
   [milestone 3](https://github.com/Silon-Oy/flow/milestone/3): `flowctl init`
   [#9](https://github.com/Silon-Oy/flow/issues/9), secrets-broker
@@ -77,7 +78,8 @@ mukaan. Avoimet työt: [issue-lista](https://github.com/Silon-Oy/flow/issues).
   [milestone 4](https://github.com/Silon-Oy/flow/milestone/4): `internal/prwatch`
   [#12](https://github.com/Silon-Oy/flow/issues/12), deploy + Tailscale
   [#13](https://github.com/Silon-Oy/flow/issues/13), gVisor opt-in
-  [#14](https://github.com/Silon-Oy/flow/issues/14).
+  [#14](https://github.com/Silon-Oy/flow/issues/14), Prometheus /metrics
+  [#22](https://github.com/Silon-Oy/flow/issues/22).
 
 Suunnitelman §17 avoimet päätökset (10–14) on ratkaistu ja kirjattu
 päätöslokiin §2.2 ([#15](https://github.com/Silon-Oy/flow/issues/15) suljettu).
