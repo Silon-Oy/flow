@@ -1,6 +1,6 @@
 // Command flowctl is the Flow developer/admin CLI; it speaks only to the
-// central service (flowd). Vaihe 1 ships the `status` command (runs + runners);
-// login/init/secret land in later phases.
+// central service (flowd). Vaihe 1 ships `status`; Vaihe 2 adds `login`
+// (§7(a) GitHub OAuth device flow); init/runner/secret land later.
 package main
 
 import (
@@ -24,6 +24,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "flowctl status:", err)
 			os.Exit(1)
 		}
+	case "login":
+		if err := runLogin(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "flowctl login:", err)
+			os.Exit(1)
+		}
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -37,6 +42,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `flowctl — Flow CLI
 
 Usage:
+  flowctl login                       sign in via GitHub OAuth device flow
   flowctl status [--status <run-status>]
 
 Env:
