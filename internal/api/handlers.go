@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Silon-Oy/flow/internal/auth"
 	"github.com/Silon-Oy/flow/internal/lease"
 	"github.com/Silon-Oy/flow/internal/runstate"
 )
@@ -29,6 +30,12 @@ type runnerRegisterResp struct {
 // runner has no credential yet, so the bootstrap tenant on the Server is
 // stamped onto the new row. Vaihe 2 replaces this with the OAuth-issued
 // tenant of the registering user.
+//
+// §7(b): the central mints a long-lived runner token here and stores only its
+// SHA-256 hash (runner.token_hash). The raw token is returned exactly once in
+// the response; afterwards the runner-token middleware authenticates by hashing
+// the presented bearer and matching this column. The token is scoped to
+// runner-write endpoints — it confers no CLI/dashboard access (see Routes()).
 func (s *Server) handleRunnerRegister(w http.ResponseWriter, r *http.Request) {
 	var req runnerRegisterReq
 	if err := decodeJSON(r, &req); err != nil {
@@ -45,15 +52,16 @@ func (s *Server) handleRunnerRegister(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()
 
-	// The runner-token scope is Vaihe 2 (RBAC). Vaihe 1 issues an opaque token
-	// the runner echoes back, so the wire contract is stable across phases.
+	// Mint the runner token and persist only its hash (§7(b)). The raw token
+	// leaves the central exactly once, in the response below.
 	token := randomToken()
+	tokenHash := auth.HashToken(token)
 	var runnerID string
 	err := s.Pool.QueryRow(ctx, `
-		INSERT INTO runner (tenant_id, hostname, capacity, status, last_heartbeat, capabilities)
-		VALUES ($1, $2, $3, 'online', now(), COALESCE($4, '{}'::jsonb))
+		INSERT INTO runner (tenant_id, hostname, capacity, status, last_heartbeat, capabilities, token_hash)
+		VALUES ($1, $2, $3, 'online', now(), COALESCE($4, '{}'::jsonb), $5)
 		RETURNING id::text`,
-		s.TenantID, req.Hostname, req.Capacity, capsJSON(req.Capabilities)).Scan(&runnerID)
+		s.TenantID, req.Hostname, req.Capacity, capsJSON(req.Capabilities), tokenHash).Scan(&runnerID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "register: "+err.Error())
 		return
