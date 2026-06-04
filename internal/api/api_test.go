@@ -251,3 +251,226 @@ func mustJSON(t *testing.T, data []byte, v any) {
 		t.Fatalf("unmarshal %s: %v", data, err)
 	}
 }
+
+// TestTenantIsolation is the load-bearing §7 invariant test: two tenants live
+// in the same DB, each with their own run + runner, and a request bearing one
+// tenant's X-Flow-Tenant-ID MUST NOT read or mutate the other tenant's data
+// through any endpoint. This is the property the WithTenant middleware exists
+// to guarantee.
+func TestTenantIsolation(t *testing.T) {
+	dsn := os.Getenv("FLOW_TEST_DSN")
+	if dsn == "" {
+		t.Skip("FLOW_TEST_DSN not set — skipping tenant isolation test")
+	}
+	ctx := context.Background()
+	pool, _, _, _ := newTestServerForIsolation(t, dsn)
+
+	// Two tenants, two projects, two runs. Seed via SQL — the wire path is
+	// what we want to test, not the seeding plumbing.
+	stamp := time.Now().UnixNano()
+	seedTenant := func(name string) (tenantID, projectID, runnerID string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `INSERT INTO tenant (name) VALUES ($1) RETURNING id::text`, name).Scan(&tenantID); err != nil {
+			t.Fatalf("seed tenant %s: %v", name, err)
+		}
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO project (tenant_id, name, owner_repo) VALUES ($1, $2, 'o/r') RETURNING id::text`,
+			tenantID, name).Scan(&projectID); err != nil {
+			t.Fatalf("seed project %s: %v", name, err)
+		}
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO runner (tenant_id, hostname) VALUES ($1, $2) RETURNING id::text`,
+			tenantID, "runner-"+name).Scan(&runnerID); err != nil {
+			t.Fatalf("seed runner %s: %v", name, err)
+		}
+		return
+	}
+	tA, pA, rA := seedTenant(fmt.Sprintf("iso-A-%d", stamp))
+	tB, pB, rB := seedTenant(fmt.Sprintf("iso-B-%d", stamp))
+
+	// The Server is constructed with tenant-A as the bootstrap fallback so
+	// requests without a header default to A — proves the test is actually
+	// exercising the explicit header path for B (not falling back).
+	srv := New(pool, tA)
+	ts := httptest.NewServer(srv.Routes())
+	t.Cleanup(ts.Close)
+
+	// Create one run per tenant via SQL so we know each tenant's run id without
+	// going through the API (which itself we are about to test).
+	runFor := func(tenantID, projectID string, issue int) string {
+		t.Helper()
+		var id string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO run (tenant_id, project_id, remote, issue_number, status, current_state)
+			 VALUES ($1, $2, 'origin', $3, 'initialized', 'S0_Idle') RETURNING id::text`,
+			tenantID, projectID, issue).Scan(&id); err != nil {
+			t.Fatalf("seed run: %v", err)
+		}
+		return id
+	}
+	runA := runFor(tA, pA, 101)
+	runB := runFor(tB, pB, 202)
+
+	do := func(method, path, tenantHeader string, body any) *http.Response {
+		t.Helper()
+		var buf bytes.Buffer
+		if body != nil {
+			if err := json.NewEncoder(&buf).Encode(body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		req, err := http.NewRequest(method, ts.URL+path, &buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if tenantHeader != "" {
+			req.Header.Set("X-Flow-Tenant-ID", tenantHeader)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		return resp
+	}
+
+	// 1. GET /v1/runs/{tenant-B-run} with tenant-A header MUST be 404.
+	resp := do(http.MethodGet, "/v1/runs/"+runB, tA, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("A reads B's run = %d, want 404 (cross-tenant leak)", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 2. Same path with tenant-B header MUST succeed (proving the 404 above was
+	//    tenancy, not a fixture bug).
+	resp = do(http.MethodGet, "/v1/runs/"+runB, tB, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("B reads B's run = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 3. PATCH cross-tenant MUST be 404 and MUST NOT mutate the row.
+	resp = do(http.MethodPatch, "/v1/runs/"+runB, tA,
+		map[string]any{"current_state": "ATTACKER_WROTE_THIS"})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("A patches B's run = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+	var cur string
+	if err := pool.QueryRow(ctx, `SELECT current_state FROM run WHERE id = $1`, runB).Scan(&cur); err != nil {
+		t.Fatal(err)
+	}
+	if cur == "ATTACKER_WROTE_THIS" {
+		t.Errorf("cross-tenant PATCH actually wrote: current_state=%q", cur)
+	}
+
+	// 4. POST events cross-tenant MUST be 404 and MUST NOT insert a row.
+	var beforeEvents int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM run_event WHERE run_id = $1`, runB).Scan(&beforeEvents); err != nil {
+		t.Fatal(err)
+	}
+	resp = do(http.MethodPost, "/v1/runs/"+runB+"/events", tA, map[string]any{
+		"events": []map[string]any{{"event": "attacker", "data": map[string]string{"x": "y"}}},
+	})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("A appends to B's events = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+	var afterEvents int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM run_event WHERE run_id = $1`, runB).Scan(&afterEvents); err != nil {
+		t.Fatal(err)
+	}
+	if afterEvents != beforeEvents {
+		t.Errorf("cross-tenant event insert leaked: before=%d after=%d", beforeEvents, afterEvents)
+	}
+
+	// 5. GET /v1/runs with tenant-A MUST NOT include B's run, and vice versa.
+	resp = do(http.MethodGet, "/v1/runs", tA, nil)
+	var listA struct {
+		Runs []struct {
+			ID string `json:"id"`
+		} `json:"runs"`
+	}
+	mustJSON(t, readBody(t, resp), &listA)
+	for _, r := range listA.Runs {
+		if r.ID == runB {
+			t.Errorf("A's run list contains B's run %s", runB)
+		}
+	}
+
+	resp = do(http.MethodGet, "/v1/runs", tB, nil)
+	var listB struct {
+		Runs []struct {
+			ID string `json:"id"`
+		} `json:"runs"`
+	}
+	mustJSON(t, readBody(t, resp), &listB)
+	for _, r := range listB.Runs {
+		if r.ID == runA {
+			t.Errorf("B's run list contains A's run %s", runA)
+		}
+	}
+
+	// 6. GET /v1/runners cross-tenant MUST NOT see the other tenant's runner.
+	resp = do(http.MethodGet, "/v1/runners", tA, nil)
+	var runnersA struct {
+		Runners []struct {
+			ID string `json:"id"`
+		} `json:"runners"`
+	}
+	mustJSON(t, readBody(t, resp), &runnersA)
+	for _, r := range runnersA.Runners {
+		if r.ID == rB {
+			t.Errorf("A sees B's runner %s in list", rB)
+		}
+	}
+
+	// 7. Runner heartbeat cross-tenant MUST be 404 (and MUST NOT bump the
+	//    other tenant's runner heartbeat). last_heartbeat is nullable until the
+	//    first heartbeat lands, so use *time.Time and compare via the pointer.
+	var prevHeartbeat *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT last_heartbeat FROM runner WHERE id = $1`, rB).Scan(&prevHeartbeat); err != nil {
+		t.Fatal(err)
+	}
+	resp = do(http.MethodPost, "/v1/runners/"+rB+"/heartbeat", tA, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("A heartbeats B's runner = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+	var newHeartbeat *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT last_heartbeat FROM runner WHERE id = $1`, rB).Scan(&newHeartbeat); err != nil {
+		t.Fatal(err)
+	}
+	bumped := (prevHeartbeat == nil) != (newHeartbeat == nil) ||
+		(prevHeartbeat != nil && newHeartbeat != nil && !newHeartbeat.Equal(*prevHeartbeat))
+	if bumped {
+		t.Errorf("cross-tenant heartbeat actually bumped B's runner: %v -> %v", prevHeartbeat, newHeartbeat)
+	}
+
+	// 8. Sanity: tenant A and tenant B are NOT the same uuid (the test wouldn't
+	//    catch anything otherwise).
+	if tA == tB {
+		t.Fatalf("tenant ids collided: %s == %s", tA, tB)
+	}
+	// Silence unused: rA is only here to symmetrically prove A's runner exists.
+	_ = rA
+}
+
+// newTestServerForIsolation returns a server WITHOUT seeding tenant/project —
+// the isolation test seeds two tenants explicitly. Returns the pool and the
+// bootstrap tenant id of the inner Server (unused fields kept for parity with
+// newTestServer).
+func newTestServerForIsolation(t *testing.T, dsn string) (*pgxpool.Pool, *httptest.Server, string, string) {
+	t.Helper()
+	if err := store.Migrate(dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool, nil, "", ""
+}

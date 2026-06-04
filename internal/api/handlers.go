@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Silon-Oy/flow/internal/lease"
 	"github.com/Silon-Oy/flow/internal/runstate"
 )
@@ -27,6 +25,10 @@ type runnerRegisterResp struct {
 	RunnerToken string `json:"runner_token"`
 }
 
+// handleRunnerRegister is a SYSTEM route (no tenant middleware): a fresh
+// runner has no credential yet, so the bootstrap tenant on the Server is
+// stamped onto the new row. Vaihe 2 replaces this with the OAuth-issued
+// tenant of the registering user.
 func (s *Server) handleRunnerRegister(w http.ResponseWriter, r *http.Request) {
 	var req runnerRegisterReq
 	if err := decodeJSON(r, &req); err != nil {
@@ -61,15 +63,19 @@ func (s *Server) handleRunnerRegister(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRunnerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	tenantID := tenantFromCtx(r.Context())
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()
 	tag, err := s.Pool.Exec(ctx,
-		`UPDATE runner SET last_heartbeat = now(), status = 'online' WHERE id = $1`, id)
+		`UPDATE runner SET last_heartbeat = now(), status = 'online'
+		  WHERE id = $1 AND tenant_id = $2`, id, tenantID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if tag.RowsAffected() == 0 {
+		// 404 even if the runner exists under another tenant — existence does
+		// not leak across the §7 boundary.
 		writeErr(w, http.StatusNotFound, "unknown runner")
 		return
 	}
@@ -77,11 +83,12 @@ func (s *Server) handleRunnerHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRunnersList(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromCtx(r.Context())
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()
 	rows, err := s.Pool.Query(ctx, `
 		SELECT id::text, hostname, capacity, active_leases, last_heartbeat, status
-		  FROM runner WHERE tenant_id = $1 ORDER BY hostname`, s.TenantID)
+		  FROM runner WHERE tenant_id = $1 ORDER BY hostname`, tenantID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -132,10 +139,11 @@ func (s *Server) handleLeaseAcquire(w http.ResponseWriter, r *http.Request) {
 	if len(req.Kinds) == 0 {
 		req.Kinds = []string{"develop"}
 	}
+	tenantID := tenantFromCtx(r.Context())
 	ctx, cancel := withTimeout(r, 10*time.Second)
 	defer cancel()
 
-	l, work, err := s.Leases.Acquire(ctx, s.TenantID, req.RunnerID, req.Kinds)
+	l, work, err := s.Leases.Acquire(ctx, tenantID, req.RunnerID, req.Kinds)
 	if errors.Is(err, lease.ErrNoWork) {
 		// 204: nothing to do. The runner backs off — NOT an error (fail-closed
 		// applies to DB unavailability, not to an empty queue).
@@ -152,15 +160,17 @@ func (s *Server) handleLeaseAcquire(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLeaseHeartbeat(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	tenantID := tenantFromCtx(r.Context())
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()
-	ok, err := s.Leases.Heartbeat(ctx, id)
+	ok, err := s.Leases.Heartbeat(ctx, tenantID, id)
 	if err != nil {
 		writeErr(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 	if !ok {
-		// Lease expired or reaped — the runner must stop work.
+		// Lease expired, reaped, or owned by another tenant — the runner must
+		// stop work either way. 409 keeps the existing wire contract.
 		writeErr(w, http.StatusConflict, "lease no longer active")
 		return
 	}
@@ -169,9 +179,10 @@ func (s *Server) handleLeaseHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLeaseRelease(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	tenantID := tenantFromCtx(r.Context())
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()
-	if err := s.Leases.Release(ctx, id); err != nil {
+	if err := s.Leases.Release(ctx, tenantID, id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -199,9 +210,10 @@ func (s *Server) handleRunCreate(w http.ResponseWriter, r *http.Request) {
 	if req.Remote == "" {
 		req.Remote = "origin"
 	}
+	tenantID := tenantFromCtx(r.Context())
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()
-	id, err := s.Runs.CreateRun(ctx, s.TenantID, req.ProjectID, req.Remote, req.IssueNumber)
+	id, err := s.Runs.CreateRun(ctx, tenantID, req.ProjectID, req.Remote, req.IssueNumber)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -231,14 +243,19 @@ func (s *Server) handleRunPatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
+	tenantID := tenantFromCtx(r.Context())
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()
-	err := s.Runs.PatchRun(ctx, id, runstate.Patch{
+	err := s.Runs.PatchRun(ctx, tenantID, id, runstate.Patch{
 		Status: req.Status, CurrentState: req.CurrentState, Branch: req.Branch,
 		PRURL: req.PRURL, BlockedReason: req.BlockedReason, RetryCount: req.RetryCount,
 		TimeoutPhase: req.TimeoutPhase, ClarificationRound: req.ClarificationRound,
 		RunnerID: req.RunnerID, LeaseID: req.LeaseID, Finished: req.Finished,
 	})
+	if errors.Is(err, runstate.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "unknown run")
+		return
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -257,9 +274,14 @@ func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
+	tenantID := tenantFromCtx(r.Context())
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()
-	if err := s.Runs.AppendEvents(ctx, id, req.Events); err != nil {
+	if err := s.Runs.AppendEvents(ctx, tenantID, id, req.Events); err != nil {
+		if errors.Is(err, runstate.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "unknown run")
+			return
+		}
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -270,10 +292,11 @@ func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRunGet(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	tenantID := tenantFromCtx(r.Context())
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()
-	run, err := s.Runs.GetRun(ctx, id)
-	if errors.Is(err, pgx.ErrNoRows) {
+	run, err := s.Runs.GetRun(ctx, tenantID, id)
+	if errors.Is(err, runstate.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "unknown run")
 		return
 	}
@@ -285,6 +308,7 @@ func (s *Server) handleRunGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRunsList(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromCtx(r.Context())
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()
 	statusFilter := r.URL.Query().Get("status")
@@ -295,7 +319,7 @@ func (s *Server) handleRunsList(w http.ResponseWriter, r *http.Request) {
 		 WHERE tenant_id = $1
 		   AND ($2 = '' OR status::text = $2)
 		 ORDER BY started_at DESC
-		 LIMIT 200`, s.TenantID, statusFilter)
+		 LIMIT 200`, tenantID, statusFilter)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -387,6 +411,7 @@ func (s *Server) handleEgressIngest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEgressList(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromCtx(r.Context())
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()
 	runID := r.URL.Query().Get("run")
@@ -394,7 +419,7 @@ func (s *Server) handleEgressList(w http.ResponseWriter, r *http.Request) {
 		SELECT run_id::text, host, allowed, ts
 		  FROM egress_log
 		 WHERE tenant_id = $1 AND ($2 = '' OR run_id::text = $2)
-		 ORDER BY ts DESC LIMIT 500`, s.TenantID, runID)
+		 ORDER BY ts DESC LIMIT 500`, tenantID, runID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

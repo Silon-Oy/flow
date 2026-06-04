@@ -8,11 +8,17 @@ package runstate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// ErrNotFound signals that no row matched the (runID, tenantID) pair — either
+// the run does not exist or it belongs to a different tenant. The handler maps
+// this to 404 so existence does not leak across tenant boundaries.
+var ErrNotFound = errors.New("runstate: run not found")
 
 // Status is the run lifecycle enum, preserved from the bash orchestrator.
 type Status string
@@ -94,31 +100,39 @@ func (s *Store) CreateRun(ctx context.Context, tenantID, projectID, remote strin
 	return id, err
 }
 
-// PatchRun applies the non-nil fields of p to the run atomically.
-func (s *Store) PatchRun(ctx context.Context, runID string, p Patch) error {
+// PatchRun applies the non-nil fields of p to the run atomically. tenantID
+// enforces the §7 tenant boundary in SQL: a patch addressed to another
+// tenant's run id silently matches zero rows and returns ErrNotFound.
+func (s *Store) PatchRun(ctx context.Context, tenantID, runID string, p Patch) error {
 	// Build a COALESCE-based update so only provided fields change. Each $N is a
 	// pointer; pgx encodes a nil pointer as SQL NULL, and COALESCE(NULL, col)
 	// keeps the existing value.
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE run SET
-		  status              = COALESCE($2, status),
-		  current_state       = COALESCE($3, current_state),
-		  branch              = COALESCE($4, branch),
-		  pr_url              = COALESCE($5, pr_url),
-		  blocked_reason      = COALESCE($6, blocked_reason),
-		  retry_count         = COALESCE($7, retry_count),
-		  timeout_phase       = COALESCE($8, timeout_phase),
-		  clarification_round = COALESCE($9, clarification_round),
-		  runner_id           = COALESCE($10::uuid, runner_id),
-		  lease_id            = COALESCE($11::uuid, lease_id),
-		  finished_at         = CASE WHEN $12 THEN now() ELSE finished_at END
-		WHERE id = $1`,
-		runID,
+		  status              = COALESCE($3, status),
+		  current_state       = COALESCE($4, current_state),
+		  branch              = COALESCE($5, branch),
+		  pr_url              = COALESCE($6, pr_url),
+		  blocked_reason      = COALESCE($7, blocked_reason),
+		  retry_count         = COALESCE($8, retry_count),
+		  timeout_phase       = COALESCE($9, timeout_phase),
+		  clarification_round = COALESCE($10, clarification_round),
+		  runner_id           = COALESCE($11::uuid, runner_id),
+		  lease_id            = COALESCE($12::uuid, lease_id),
+		  finished_at         = CASE WHEN $13 THEN now() ELSE finished_at END
+		WHERE id = $1 AND tenant_id = $2`,
+		runID, tenantID,
 		statusArg(p.Status),
 		p.CurrentState, p.Branch, p.PRURL, p.BlockedReason,
 		p.RetryCount, p.TimeoutPhase, p.ClarificationRound,
 		p.RunnerID, p.LeaseID, p.Finished)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // statusArg converts a *Status to a *string for the query (nil stays nil).
@@ -131,10 +145,24 @@ func statusArg(s *Status) *string {
 }
 
 // AppendEvents bulk-inserts a batch of run events (the telemetry push path:
-// batched 5s / 20 events). Order is preserved.
-func (s *Store) AppendEvents(ctx context.Context, runID string, events []Event) error {
+// batched 5s / 20 events). Order is preserved. tenantID is verified once up
+// front so a cross-tenant runID is rejected with ErrNotFound before any event
+// rows are written.
+func (s *Store) AppendEvents(ctx context.Context, tenantID, runID string, events []Event) error {
 	if len(events) == 0 {
 		return nil
+	}
+	// Cheap pre-check: a tenant-scoped EXISTS that costs one round-trip but
+	// guarantees the §7 boundary even though run_event itself has no tenant_id
+	// column (the column lives on the parent run row).
+	var exists bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM run WHERE id = $1 AND tenant_id = $2)`,
+		runID, tenantID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNotFound
 	}
 	batch := &pgx.Batch{}
 	for _, e := range events {
@@ -160,28 +188,38 @@ func (s *Store) AppendEvents(ctx context.Context, runID string, events []Event) 
 	return nil
 }
 
-// GetRun loads a single run by id.
-func (s *Store) GetRun(ctx context.Context, runID string) (*Run, error) {
+// GetRun loads a single run by id, scoped to tenantID. A row that exists but
+// belongs to another tenant returns ErrNotFound so cross-tenant existence
+// cannot be probed by uuid guessing.
+func (s *Store) GetRun(ctx context.Context, tenantID, runID string) (*Run, error) {
 	var r Run
 	err := s.pool.QueryRow(ctx, `
 		SELECT id::text, tenant_id::text, project_id::text, runner_id::text, lease_id::text,
 		       remote, issue_number, status, current_state, branch, pr_url, blocked_reason,
 		       retry_count, timeout_phase, clarification_round, started_at, finished_at
-		  FROM run WHERE id = $1`, runID).
+		  FROM run WHERE id = $1 AND tenant_id = $2`, runID, tenantID).
 		Scan(&r.ID, &r.TenantID, &r.ProjectID, &r.RunnerID, &r.LeaseID,
 			&r.Remote, &r.IssueNumber, &r.Status, &r.CurrentState, &r.Branch, &r.PRURL,
 			&r.BlockedReason, &r.RetryCount, &r.TimeoutPhase, &r.ClarificationRound,
 			&r.StartedAt, &r.FinishedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
 	if err != nil {
 		return nil, err
 	}
 	return &r, nil
 }
 
-// ListEvents returns the events for a run in chronological order.
-func (s *Store) ListEvents(ctx context.Context, runID string) ([]Event, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT event, data, ts FROM run_event WHERE run_id = $1 ORDER BY ts ASC, seq ASC`, runID)
+// ListEvents returns the events for a run in chronological order, scoped to
+// tenantID via the parent run row.
+func (s *Store) ListEvents(ctx context.Context, tenantID, runID string) ([]Event, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT e.event, e.data, e.ts
+		  FROM run_event e
+		  JOIN run r ON r.id = e.run_id
+		 WHERE e.run_id = $1 AND r.tenant_id = $2
+		 ORDER BY e.ts ASC, e.seq ASC`, runID, tenantID)
 	if err != nil {
 		return nil, err
 	}

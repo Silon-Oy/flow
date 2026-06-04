@@ -127,15 +127,17 @@ func (m *Manager) Acquire(ctx context.Context, tenantID, runnerID string, kinds 
 	return &l, &w, nil
 }
 
-// Heartbeat re-extends an active lease's expiry by TTL. Returns false if the
-// lease no longer exists or is not active (e.g. already reaped) — the caller
-// must then stop work or re-acquire.
-func (m *Manager) Heartbeat(ctx context.Context, leaseID string) (bool, error) {
+// Heartbeat re-extends an active lease's expiry by TTL. tenantID enforces the
+// §7 boundary: a heartbeat addressed to another tenant's lease matches zero
+// rows and returns (false, nil), so the caller stops as if the lease were
+// reaped. Returns false if the lease no longer exists, is not active, or
+// belongs to a different tenant.
+func (m *Manager) Heartbeat(ctx context.Context, tenantID, leaseID string) (bool, error) {
 	tag, err := m.pool.Exec(ctx, `
 		UPDATE lease
-		   SET expires_at = now() + make_interval(secs => $2)
-		 WHERE id = $1 AND status = 'active' AND expires_at > now()`,
-		leaseID, m.ttl.Seconds())
+		   SET expires_at = now() + make_interval(secs => $3)
+		 WHERE id = $1 AND tenant_id = $2 AND status = 'active' AND expires_at > now()`,
+		leaseID, tenantID, m.ttl.Seconds())
 	if err != nil {
 		return false, err
 	}
@@ -143,10 +145,12 @@ func (m *Manager) Heartbeat(ctx context.Context, leaseID string) (bool, error) {
 }
 
 // Release marks an active lease as released so the work can be re-claimed (or
-// removed by the scanner). Idempotent.
-func (m *Manager) Release(ctx context.Context, leaseID string) error {
+// removed by the scanner). Idempotent. tenantID enforces the §7 boundary: a
+// release addressed to another tenant's lease matches zero rows (no-op).
+func (m *Manager) Release(ctx context.Context, tenantID, leaseID string) error {
 	_, err := m.pool.Exec(ctx,
-		`UPDATE lease SET status = 'released' WHERE id = $1 AND status = 'active'`, leaseID)
+		`UPDATE lease SET status = 'released'
+		  WHERE id = $1 AND tenant_id = $2 AND status = 'active'`, leaseID, tenantID)
 	return err
 }
 

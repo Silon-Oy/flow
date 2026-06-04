@@ -94,13 +94,19 @@ func TestAcquireReleaseRoundtrip(t *testing.T) {
 	}
 
 	// Heartbeat extends the active lease.
-	ok, err := m.Heartbeat(ctx, l.ID)
+	ok, err := m.Heartbeat(ctx, tenantID, l.ID)
 	if err != nil || !ok {
 		t.Errorf("heartbeat = %v,%v want true,nil", ok, err)
 	}
 
+	// Cross-tenant heartbeat MUST silently match zero rows — proves the §7
+	// boundary is enforced in SQL, not just at the handler layer.
+	if okOther, err := m.Heartbeat(ctx, "00000000-0000-0000-0000-000000000000", l.ID); err != nil || okOther {
+		t.Errorf("cross-tenant heartbeat = %v,%v want false,nil", okOther, err)
+	}
+
 	// Release returns the work to the queue.
-	if err := m.Release(ctx, l.ID); err != nil {
+	if err := m.Release(ctx, tenantID, l.ID); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 	if _, _, err := m.Acquire(ctx, tenantID, runnerID, []string{"develop"}); err != nil {
