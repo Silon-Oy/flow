@@ -48,6 +48,14 @@ func main() {
 	}
 	log.Printf("flowd: bootstrap tenant %q -> %s", tenantName, tenantID)
 
+	// Optional: promote a named GitHub login to admin in the bootstrap tenant.
+	// Empty => skip (a single-user deploy can run as developer-only). This is
+	// the only knob that mints an admin without a prior admin to authorise it;
+	// admins thereafter manage roles via SQL (or the admin CLI in #9).
+	if err := bootstrapAdmin(rootCtx, st, tenantID); err != nil {
+		log.Fatalf("flowd: bootstrap admin: %v", err)
+	}
+
 	// Optional: bootstrap a single github_app_install row from env. Mirrors
 	// the github-app-auth.sh one-triplet model so a single-tenant deploy
 	// works out of the box; additional installations are added via SQL
@@ -88,6 +96,28 @@ func main() {
 	if err := httpSrv.Shutdown(ctx); err != nil {
 		log.Printf("flowd: graceful shutdown failed: %v", err)
 	}
+}
+
+// bootstrapAdmin upserts an app_user row with role=admin for the GitHub login
+// in FLOW_BOOTSTRAP_ADMIN in the bootstrap tenant. Idempotent: an existing
+// row is promoted, a missing row is created. Empty env => no-op. Roles are
+// enforced by middleware (§7); this knob exists so the first admin can exist
+// before any other admin has authorised one.
+func bootstrapAdmin(ctx context.Context, st *store.Store, tenantID string) error {
+	login := os.Getenv("FLOW_BOOTSTRAP_ADMIN")
+	if login == "" {
+		return nil
+	}
+	if _, err := st.Pool.Exec(ctx, `
+		INSERT INTO app_user (tenant_id, github_login, role)
+		VALUES ($1, $2, 'admin'::user_role)
+		ON CONFLICT (tenant_id, github_login) DO UPDATE
+		   SET role = 'admin'::user_role`,
+		tenantID, login); err != nil {
+		return err
+	}
+	log.Printf("flowd: bootstrap admin: tenant=%s github_login=%s", tenantID, login)
+	return nil
 }
 
 // ensureTenant returns the id of the bootstrap tenant, creating it if absent.
