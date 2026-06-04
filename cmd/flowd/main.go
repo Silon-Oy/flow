@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -46,6 +47,14 @@ func main() {
 		log.Fatalf("flowd: bootstrap tenant: %v", err)
 	}
 	log.Printf("flowd: bootstrap tenant %q -> %s", tenantName, tenantID)
+
+	// Optional: bootstrap a single github_app_install row from env. Mirrors
+	// the github-app-auth.sh one-triplet model so a single-tenant deploy
+	// works out of the box; additional installations are added via SQL
+	// until #9 (admin CLI) ships. Empty FLOW_GITHUB_APP_ORG => skip.
+	if err := bootstrapAppInstall(rootCtx, st, tenantID); err != nil {
+		log.Fatalf("flowd: bootstrap github-app install: %v", err)
+	}
 
 	srv := api.New(st.Pool, tenantID)
 
@@ -90,6 +99,45 @@ func ensureTenant(ctx context.Context, st *store.Store, name string) (string, er
 		ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
 		RETURNING id::text`, name).Scan(&id)
 	return id, err
+}
+
+// bootstrapAppInstall upserts a github_app_install row from env vars when
+// FLOW_GITHUB_APP_ORG is set. Missing/blank ORG = no-op (the broker simply
+// has no installations to serve). app_id and installation_id must parse as
+// integers; private_key_ref is the *env var name* the EnvResolver looks up
+// at mint-time, never the key itself.
+func bootstrapAppInstall(ctx context.Context, st *store.Store, tenantID string) error {
+	org := os.Getenv("FLOW_GITHUB_APP_ORG")
+	if org == "" {
+		return nil
+	}
+	appIDStr := os.Getenv("FLOW_GITHUB_APP_ID")
+	installIDStr := os.Getenv("FLOW_GITHUB_APP_INSTALLATION_ID")
+	keyRef := os.Getenv("FLOW_GITHUB_APP_PRIVATE_KEY_REF")
+	if appIDStr == "" || installIDStr == "" || keyRef == "" {
+		return errors.New("FLOW_GITHUB_APP_ORG is set but FLOW_GITHUB_APP_ID / FLOW_GITHUB_APP_INSTALLATION_ID / FLOW_GITHUB_APP_PRIVATE_KEY_REF is missing")
+	}
+	appID, err := strconv.ParseInt(appIDStr, 10, 64)
+	if err != nil {
+		return errors.New("FLOW_GITHUB_APP_ID must be an integer")
+	}
+	installID, err := strconv.ParseInt(installIDStr, 10, 64)
+	if err != nil {
+		return errors.New("FLOW_GITHUB_APP_INSTALLATION_ID must be an integer")
+	}
+	if _, err := st.Pool.Exec(ctx, `
+		INSERT INTO github_app_install (tenant_id, org, app_id, installation_id, private_key_ref)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (tenant_id, org) DO UPDATE
+		   SET app_id          = EXCLUDED.app_id,
+		       installation_id = EXCLUDED.installation_id,
+		       private_key_ref = EXCLUDED.private_key_ref`,
+		tenantID, org, appID, installID, keyRef); err != nil {
+		return err
+	}
+	log.Printf("flowd: bootstrap github-app install: tenant=%s org=%s app_id=%d install_id=%d key_ref=%s",
+		tenantID, org, appID, installID, keyRef)
+	return nil
 }
 
 func runReaper(ctx context.Context, m *lease.Manager) {
