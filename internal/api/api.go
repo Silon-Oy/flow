@@ -51,9 +51,10 @@ type Server struct {
 // reads `private_key_ref` as an env var name, issue #10 swaps it for a
 // pgcrypto resolver behind the same interface.
 //
-// BrokerToken is the shared bearer that gates /v1/github-app/token. It's a
-// stop-gap until issue #6 lands per-runner tokens stored in the runner table;
-// empty means the endpoint refuses every call (fail-closed — the central
+// BrokerToken is the shared bearer that gates /v1/github-app/token. Issue #6
+// landed per-runner tokens on the runner-write endpoints, but this broker
+// endpoint still rides the shared bearer (folding it onto runner tokens is a
+// follow-up); empty means the endpoint refuses every call (fail-closed — the central
 // never mints App tokens for unauthenticated callers, even on a private
 // network).
 func New(pool *pgxpool.Pool, tenantID string) *Server {
@@ -89,8 +90,20 @@ func (s *Server) Routes() http.Handler {
 	// for a runner-token-derived tenant.
 	mux.HandleFunc("POST /v1/egress", s.handleEgressIngest)
 
-	// Tenant-scoped routes — wrapped per-route so a future runner-token
-	// extractor can be plugged in without touching the routing table.
+	// Two tenant-scoped route groups, split by the credential that pins the
+	// tenant (§7(b)):
+	//
+	//   - runnerWrite: the machine path. The per-runner token minted at register
+	//     authenticates the request; runnerTokenExtractor resolves its tenant.
+	//     Wiring the extractor here and NOWHERE else is what scopes the runner
+	//     token to runner endpoints only — it grants no read/dashboard access.
+	//   - scoped (read/dashboard): the human path. Still the Vaihe 1 header stub;
+	//     user-session enforcement is issue #7. A runner token presented here is
+	//     simply not honored as a credential (the header extractor ignores it).
+	runnerAuth := auth.WithTenant(s.runnerTokenExtractor)
+	runnerWrite := func(method, pattern string, h http.HandlerFunc) {
+		mux.Handle(method+" "+pattern, runnerAuth(h))
+	}
 	tenant := auth.WithTenant(auth.HeaderExtractor(s.TenantID))
 	scoped := func(method, pattern string, h http.HandlerFunc) {
 		mux.Handle(method+" "+pattern, tenant(h))
@@ -106,20 +119,21 @@ func (s *Server) Routes() http.Handler {
 		mux.Handle(method+" "+pattern, tenant(chain))
 	}
 
-	// Runner <-> central (machine identity).
-	scoped("POST", "/v1/runners/{id}/heartbeat", s.handleRunnerHeartbeat)
+	// Runner-write endpoints (§7(b) runner-token scope): machine identity,
+	// lease lifecycle, run telemetry. Each REQUIRES a valid runner token.
+	runnerWrite("POST", "/v1/runners/{id}/heartbeat", s.handleRunnerHeartbeat)
+	runnerWrite("POST", "/v1/leases/acquire", s.handleLeaseAcquire)
+	runnerWrite("POST", "/v1/leases/{id}/heartbeat", s.handleLeaseHeartbeat)
+	runnerWrite("POST", "/v1/leases/{id}/release", s.handleLeaseRelease)
+	runnerWrite("POST", "/v1/runs", s.handleRunCreate)
+	runnerWrite("PATCH", "/v1/runs/{id}", s.handleRunPatch)
+	runnerWrite("POST", "/v1/runs/{id}/events", s.handleRunEvents)
+
+	// Read/dashboard endpoints — RBAC (§7). The runner token is NOT a credential
+	// here; RequireAuth resolves the user session and RequireRole gates the
+	// capability.
 	// §7 row "Hallitsee jaettuja runnereita" — admin-only list.
 	rbacScoped("GET", "/v1/runners", auth.CapRunnersManageShared, s.handleRunnersList)
-
-	// Lease lifecycle.
-	scoped("POST", "/v1/leases/acquire", s.handleLeaseAcquire)
-	scoped("POST", "/v1/leases/{id}/heartbeat", s.handleLeaseHeartbeat)
-	scoped("POST", "/v1/leases/{id}/release", s.handleLeaseRelease)
-
-	// Run telemetry.
-	scoped("POST", "/v1/runs", s.handleRunCreate)
-	scoped("PATCH", "/v1/runs/{id}", s.handleRunPatch)
-	scoped("POST", "/v1/runs/{id}/events", s.handleRunEvents)
 	// §7 rows "Näkee omat ajot" / "Näkee koko tenantin ajot" — capability
 	// gates the endpoint; the handler then filters by principal.UserID for
 	// developers (admins see the whole tenant).
@@ -137,8 +151,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/auth/device/start", s.handleDeviceStart)
 	mux.HandleFunc("POST /v1/auth/device/poll", s.handleDevicePoll)
 
-	// §7.3 GitHub App token broker. Gated by FLOW_BROKER_TOKEN shared secret
-	// until issue #6 lands per-runner tokens in the runner table.
+	// §7.3 GitHub App token broker. Still gated by the FLOW_BROKER_TOKEN shared
+	// secret; #6 added per-runner tokens elsewhere but this endpoint's switch to
+	// them is a follow-up.
 	mux.HandleFunc("GET /v1/github-app/token", s.handleGitHubAppToken)
 
 	return logRequests(mux)
