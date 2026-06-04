@@ -13,8 +13,55 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Silon-Oy/flow/internal/auth"
 	"github.com/Silon-Oy/flow/internal/store"
 )
+
+// seedAdminSession creates an admin app_user in tenant + a fresh user_session
+// row, returning the raw bearer token a test client should send as
+// `Authorization: Bearer <token>` to satisfy RequireAuth/RequireRole on the
+// RBAC-gated routes (§7 — `/v1/runs`, `/v1/runners`).
+func seedAdminSession(t *testing.T, pool *pgxpool.Pool, tenantID string) string {
+	t.Helper()
+	return seedSession(t, pool, tenantID, "admin", "admin-"+tenantID)
+}
+
+func seedSession(t *testing.T, pool *pgxpool.Pool, tenantID, role, login string) string {
+	t.Helper()
+	ctx := context.Background()
+	var userID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO app_user (tenant_id, github_login, role)
+		VALUES ($1, $2, $3::user_role)
+		ON CONFLICT (tenant_id, github_login) DO UPDATE SET role = EXCLUDED.role
+		RETURNING id::text`, tenantID, login, role).Scan(&userID); err != nil {
+		t.Fatalf("seed app_user: %v", err)
+	}
+	raw := fmt.Sprintf("test-token-%d-%s", time.Now().UnixNano(), userID)
+	hash := auth.HashToken(raw)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO user_session (user_id, token_hash, expires_at)
+		VALUES ($1, $2, now() + interval '1 hour')`, userID, hash); err != nil {
+		t.Fatalf("seed user_session: %v", err)
+	}
+	return raw
+}
+
+func getWithToken(t *testing.T, url, token string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	return resp
+}
 
 func newTestServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, string, string) {
 	t.Helper()
@@ -181,11 +228,10 @@ func TestFullRunnerWorkflow(t *testing.T) {
 		t.Fatalf("release: %d", resp.StatusCode)
 	}
 
-	// 10. List runs (filtered).
-	lr, err := http.Get(ts.URL + "/v1/runs")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// 10. List runs (filtered). /v1/runs is RBAC-gated (§7) so we need an
+	// admin session to see the whole tenant.
+	adminToken := seedAdminSession(t, pool, tenantID)
+	lr := getWithToken(t, ts.URL+"/v1/runs", adminToken)
 	var list struct {
 		Runs []map[string]any `json:"runs"`
 	}
@@ -311,6 +357,22 @@ func TestTenantIsolation(t *testing.T) {
 	runA := runFor(tA, pA, 101)
 	runB := runFor(tB, pB, 202)
 
+	// Seed an admin session per tenant so the RBAC-gated routes (§7) can be
+	// exercised. The bearer token's tenant matches the X-Flow-Tenant-ID
+	// header — RequireAuth's cross-tenant guard rejects mismatches.
+	tokenA := seedSession(t, pool, tA, "admin", "admin-A-"+tA)
+	tokenB := seedSession(t, pool, tB, "admin", "admin-B-"+tB)
+	tokenFor := func(tenantHeader string) string {
+		switch tenantHeader {
+		case tA:
+			return tokenA
+		case tB:
+			return tokenB
+		default:
+			return ""
+		}
+	}
+
 	do := func(method, path, tenantHeader string, body any) *http.Response {
 		t.Helper()
 		var buf bytes.Buffer
@@ -326,6 +388,9 @@ func TestTenantIsolation(t *testing.T) {
 		req.Header.Set("Content-Type", "application/json")
 		if tenantHeader != "" {
 			req.Header.Set("X-Flow-Tenant-ID", tenantHeader)
+			if tok := tokenFor(tenantHeader); tok != "" {
+				req.Header.Set("Authorization", "Bearer "+tok)
+			}
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
