@@ -18,8 +18,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silon-Oy/flow/internal/auth"
+	"github.com/Silon-Oy/flow/internal/githubapp"
 	"github.com/Silon-Oy/flow/internal/lease"
 	"github.com/Silon-Oy/flow/internal/runstate"
+	"github.com/Silon-Oy/flow/internal/secrets"
 )
 
 // Server holds the dependencies the handlers share.
@@ -28,6 +30,7 @@ type Server struct {
 	Leases   *lease.Manager
 	Runs     *runstate.Store
 	Auth     *auth.Service
+	GHApp    *githubapp.Broker
 	TenantID string // bootstrap tenant (single-tenant Vaihe 1)
 
 	// hub fans out run events to SSE subscribers.
@@ -37,12 +40,17 @@ type Server struct {
 // New builds a Server over the given pool with a resolved bootstrap tenant. The
 // GitHub OAuth client_id is read from FLOW_GITHUB_OAUTH_CLIENT_ID; when empty
 // the device-flow endpoints return 503 (the rest of the API still works).
+//
+// The GitHub App broker is wired with the env-backed secrets resolver: Vaihe 1
+// reads `private_key_ref` as an env var name, issue #10 swaps it for a
+// pgcrypto resolver behind the same interface.
 func New(pool *pgxpool.Pool, tenantID string) *Server {
 	return &Server{
 		Pool:     pool,
 		Leases:   lease.NewManager(pool),
 		Runs:     runstate.New(pool),
 		Auth:     auth.New(pool, tenantID, os.Getenv("FLOW_GITHUB_OAUTH_CLIENT_ID")),
+		GHApp:    githubapp.NewBroker(pool, secrets.EnvResolver{}),
 		TenantID: tenantID,
 		hub:      newLogHub(),
 	}
@@ -82,6 +90,10 @@ func (s *Server) Routes() http.Handler {
 	// else will require in Vaihe 2.
 	mux.HandleFunc("POST /v1/auth/device/start", s.handleDeviceStart)
 	mux.HandleFunc("POST /v1/auth/device/poll", s.handleDevicePoll)
+
+	// §7.3 GitHub App token broker. Vaihe 2 will enforce a runner-token via #6;
+	// for now the endpoint accepts the bootstrap tenant by default.
+	mux.HandleFunc("GET /v1/github-app/token", s.handleGitHubAppToken)
 
 	return logRequests(mux)
 }
