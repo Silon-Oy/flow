@@ -39,6 +39,11 @@ type Server struct {
 	TenantID    string
 	BrokerToken string // pre-shared bearer for §7.3 token broker (FLOW_BROKER_TOKEN)
 
+	// BranchValidator validates per-remote base_branch existence on POST
+	// /v1/projects (§8 wizard). Default is the broker-backed validator; tests
+	// inject a stub so they don't need a live GitHub.
+	BranchValidator BranchValidator
+
 	// hub fans out run events to SSE subscribers.
 	hub *logHub
 }
@@ -58,15 +63,17 @@ type Server struct {
 // never mints App tokens for unauthenticated callers, even on a private
 // network).
 func New(pool *pgxpool.Pool, tenantID string) *Server {
+	broker := githubapp.NewBroker(pool, secrets.EnvResolver{})
 	return &Server{
-		Pool:        pool,
-		Leases:      lease.NewManager(pool),
-		Runs:        runstate.New(pool),
-		Auth:        auth.New(pool, tenantID, os.Getenv("FLOW_GITHUB_OAUTH_CLIENT_ID")),
-		GHApp:       githubapp.NewBroker(pool, secrets.EnvResolver{}),
-		TenantID:    tenantID,
-		BrokerToken: os.Getenv("FLOW_BROKER_TOKEN"),
-		hub:         newLogHub(),
+		Pool:            pool,
+		Leases:          lease.NewManager(pool),
+		Runs:            runstate.New(pool),
+		Auth:            auth.New(pool, tenantID, os.Getenv("FLOW_GITHUB_OAUTH_CLIENT_ID")),
+		GHApp:           broker,
+		TenantID:        tenantID,
+		BrokerToken:     os.Getenv("FLOW_BROKER_TOKEN"),
+		BranchValidator: NewBranchValidator(broker),
+		hub:             newLogHub(),
 	}
 }
 
@@ -132,6 +139,11 @@ func (s *Server) Routes() http.Handler {
 	// Read/dashboard endpoints — RBAC (§7). The runner token is NOT a credential
 	// here; RequireAuth resolves the user session and RequireRole gates the
 	// capability.
+	// §7 row "Rekisteröi projekti (wizard)" — `flowctl init`. Both admin and
+	// developer hold CapProjectRegister; the central validates §8 before
+	// inserting (acceptance criterion: validation lives in the central, not
+	// just in the CLI).
+	rbacScoped("POST", "/v1/projects", auth.CapProjectRegister, s.handleProjectCreate)
 	// §7 row "Hallitsee jaettuja runnereita" — admin-only list.
 	rbacScoped("GET", "/v1/runners", auth.CapRunnersManageShared, s.handleRunnersList)
 	// §7 rows "Näkee omat ajot" / "Näkee koko tenantin ajot" — capability

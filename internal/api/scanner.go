@@ -61,12 +61,15 @@ type scanProject struct {
 	labels    []string
 }
 
-// remoteEntry maps a remote name to its resolved owner/repo. The scanner reads
-// owner/repo directly from project config (the runner resolves git remotes
-// locally; the scanner has no clone).
+// remoteEntry is the canonical PROJECT.remotes[] shape (§8, päätös 14): the
+// remote name + its resolved owner/repo + an optional per-remote base_branch
+// override. The scanner reads owner/repo directly from project config (the
+// runner resolves git remotes locally; the scanner has no clone). base_branch
+// is consumed elsewhere; the scanner only needs name + owner/repo.
 type remoteEntry struct {
-	Name      string `json:"name"`
-	OwnerRepo string `json:"owner_repo"`
+	Remote     string `json:"remote"`
+	OwnerRepo  string `json:"owner_repo"`
+	BaseBranch string `json:"base_branch,omitempty"`
 }
 
 // scanOnce iterates EVERY tenant's projects and enqueues their auto-run
@@ -86,7 +89,7 @@ func (sc *Scanner) scanOnce(ctx context.Context) {
 		// A project with no explicit remotes scans its owner_repo as "origin".
 		remotes := p.remotes
 		if len(remotes) == 0 {
-			remotes = []remoteEntry{{Name: "origin", OwnerRepo: p.ownerRepo}}
+			remotes = []remoteEntry{{Remote: "origin", OwnerRepo: p.ownerRepo}}
 		}
 		labels := p.labels
 		if len(labels) == 0 {
@@ -107,7 +110,7 @@ func (sc *Scanner) scanOnce(ctx context.Context) {
 					continue
 				}
 				for _, is := range issues {
-					sc.enqueue(ctx, p.tenantID, p.id, rem.Name, is.Number)
+					sc.enqueue(ctx, p.tenantID, p.id, rem.Remote, is.Number)
 				}
 			}
 		}
