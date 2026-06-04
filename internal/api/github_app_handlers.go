@@ -19,8 +19,10 @@ type ghAppTokenResp struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// authorizeBroker enforces the §7.3 endpoint's pre-shared bearer. This is a
-// stop-gap until issue #6 lands per-runner tokens in the runner table:
+// authorizeBroker enforces the §7.3 endpoint's pre-shared bearer. Issue #6
+// landed per-runner tokens for the runner-write endpoints, but this broker
+// endpoint still rides the shared FLOW_BROKER_TOKEN; folding it onto runner
+// tokens is a follow-up. Behaviour:
 //
 //   - BrokerToken empty  → 503 (broker not configured; fail-closed).
 //   - Missing / malformed Authorization header → 401.
@@ -53,9 +55,9 @@ func (s *Server) authorizeBroker(w http.ResponseWriter, r *http.Request) bool {
 // surface `GET /v1/github-app/token?tenant&org`.
 //
 // `tenant` defaults to the bootstrap tenant when omitted — Vaihe 1 ships a
-// single tenant in data. Vaihe 2 (issue #6) wires runner-token middleware
-// that resolves tenant from the bearer and refuses tenant overrides that
-// disagree with the authenticated identity.
+// single tenant in data. A follow-up will resolve the tenant from the runner
+// token (issue #6 added that token to the runner-write endpoints) and refuse
+// tenant overrides that disagree with the authenticated identity.
 func (s *Server) handleGitHubAppToken(w http.ResponseWriter, r *http.Request) {
 	if s.GHApp == nil {
 		writeErr(w, http.StatusServiceUnavailable, "github-app broker not configured")

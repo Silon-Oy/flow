@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Silon-Oy/flow/internal/auth"
 	"github.com/Silon-Oy/flow/internal/store"
 )
 
@@ -63,6 +64,32 @@ func post(t *testing.T, url string, body any) (*http.Response, []byte) {
 	return resp, data
 }
 
+// postAuth posts with a runner-token bearer (§7(b)). Runner-write endpoints
+// require it; the register response is the only place the raw token is handed
+// out.
+func postAuth(t *testing.T, url, token string, body any) (*http.Response, []byte) {
+	t.Helper()
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req, err := http.NewRequest(http.MethodPost, url, &buf)
+	if err != nil {
+		t.Fatalf("new request %s: %v", url, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	return resp, readBody(t, resp)
+}
+
 func readBody(t *testing.T, resp *http.Response) []byte {
 	t.Helper()
 	defer resp.Body.Close()
@@ -90,8 +117,9 @@ func TestFullRunnerWorkflow(t *testing.T) {
 		t.Fatalf("register returned empty id/token: %s", data)
 	}
 
-	// 2. Empty queue -> 204 (not an error).
-	resp, _ = post(t, ts.URL+"/v1/leases/acquire", map[string]any{"runner_id": reg.RunnerID, "kinds": []string{"develop"}})
+	// 2. Empty queue -> 204 (not an error). All runner-write calls below carry
+	// the §7(b) runner token minted at register.
+	resp, _ = postAuth(t, ts.URL+"/v1/leases/acquire", reg.RunnerToken, map[string]any{"runner_id": reg.RunnerID, "kinds": []string{"develop"}})
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("acquire empty: %d, want 204", resp.StatusCode)
 	}
@@ -103,7 +131,7 @@ func TestFullRunnerWorkflow(t *testing.T) {
 		 VALUES ($1,$2,$3,'origin',55,'develop')`, tenantID, projectID, wk); err != nil {
 		t.Fatal(err)
 	}
-	resp, data = post(t, ts.URL+"/v1/leases/acquire", map[string]any{"runner_id": reg.RunnerID, "kinds": []string{"develop"}})
+	resp, data = postAuth(t, ts.URL+"/v1/leases/acquire", reg.RunnerToken, map[string]any{"runner_id": reg.RunnerID, "kinds": []string{"develop"}})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("acquire: %d %s", resp.StatusCode, data)
 	}
@@ -121,13 +149,13 @@ func TestFullRunnerWorkflow(t *testing.T) {
 	}
 
 	// 4. Lease heartbeat.
-	resp, _ = post(t, ts.URL+"/v1/leases/"+acq.Lease.ID+"/heartbeat", nil)
+	resp, _ = postAuth(t, ts.URL+"/v1/leases/"+acq.Lease.ID+"/heartbeat", reg.RunnerToken, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("lease heartbeat: %d", resp.StatusCode)
 	}
 
 	// 5. Create a run.
-	resp, data = post(t, ts.URL+"/v1/runs", map[string]any{"project_id": projectID, "remote": "origin", "issue_number": 55})
+	resp, data = postAuth(t, ts.URL+"/v1/runs", reg.RunnerToken, map[string]any{"project_id": projectID, "remote": "origin", "issue_number": 55})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create run: %d %s", resp.StatusCode, data)
 	}
@@ -140,6 +168,7 @@ func TestFullRunnerWorkflow(t *testing.T) {
 	patchReq, _ := http.NewRequest(http.MethodPatch, ts.URL+"/v1/runs/"+rc.RunID,
 		bytes.NewBufferString(`{"branch":"auto-run/issue-55","current_state":"S8"}`))
 	patchReq.Header.Set("Content-Type", "application/json")
+	patchReq.Header.Set("Authorization", "Bearer "+reg.RunnerToken)
 	pr, err := http.DefaultClient.Do(patchReq)
 	if err != nil {
 		t.Fatal(err)
@@ -150,7 +179,7 @@ func TestFullRunnerWorkflow(t *testing.T) {
 	pr.Body.Close()
 
 	// 7. Push events.
-	resp, data = post(t, ts.URL+"/v1/runs/"+rc.RunID+"/events", map[string]any{
+	resp, data = postAuth(t, ts.URL+"/v1/runs/"+rc.RunID+"/events", reg.RunnerToken, map[string]any{
 		"events": []map[string]any{
 			{"event": "claimed", "data": map[string]string{"work_key": wk}},
 			{"event": "implementer_result", "data": map[string]string{"result": "SUCCESS"}},
@@ -176,7 +205,7 @@ func TestFullRunnerWorkflow(t *testing.T) {
 	}
 
 	// 9. Release lease.
-	resp, _ = post(t, ts.URL+"/v1/leases/"+acq.Lease.ID+"/release", nil)
+	resp, _ = postAuth(t, ts.URL+"/v1/leases/"+acq.Lease.ID+"/release", reg.RunnerToken, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("release: %d", resp.StatusCode)
 	}
@@ -193,6 +222,89 @@ func TestFullRunnerWorkflow(t *testing.T) {
 	if len(list.Runs) == 0 {
 		t.Errorf("expected at least one run in list")
 	}
+}
+
+// TestRunnerTokenScope is the §7(b) acceptance test: the per-runner token
+// minted at register is REQUIRED on runner-write endpoints (full enforcement —
+// a request with no token, or a bogus token, is rejected) and the token is
+// scoped to those endpoints only. The dashboard/read endpoints do not honor it
+// as a credential — their user-session enforcement is issue #7 — so the runner
+// token can never be the thing that unlocks CLI/dashboard data.
+func TestRunnerTokenScope(t *testing.T) {
+	ts, pool, tenantID, _ := newTestServer(t)
+	ctx := context.Background()
+
+	// Register → mint a real scoped runner token; its hash (not the raw token)
+	// is persisted on the runner row.
+	resp, data := post(t, ts.URL+"/v1/runners/register", map[string]any{"hostname": "scope-host", "capacity": 1})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register: %d %s", resp.StatusCode, data)
+	}
+	var reg struct {
+		RunnerID    string `json:"runner_id"`
+		RunnerToken string `json:"runner_token"`
+	}
+	mustJSON(t, data, &reg)
+	if reg.RunnerToken == "" {
+		t.Fatalf("register returned empty token: %s", data)
+	}
+
+	// The raw token is NOT stored — only its SHA-256 hash, and it matches.
+	var storedHash []byte
+	if err := pool.QueryRow(ctx, `SELECT token_hash FROM runner WHERE id = $1`, reg.RunnerID).Scan(&storedHash); err != nil {
+		t.Fatalf("read token_hash: %v", err)
+	}
+	if !bytes.Equal(storedHash, auth.HashToken(reg.RunnerToken)) {
+		t.Errorf("stored token_hash does not match sha256(raw token)")
+	}
+	if bytes.Equal(storedHash, []byte(reg.RunnerToken)) {
+		t.Errorf("raw token was persisted verbatim — must store only the hash")
+	}
+
+	acquireBody := map[string]any{"runner_id": reg.RunnerID, "kinds": []string{"develop"}}
+
+	// 1. Runner-write with NO token → 401 (the gate is closed by default).
+	resp, _ = post(t, ts.URL+"/v1/leases/acquire", acquireBody)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("acquire without token = %d, want 401", resp.StatusCode)
+	}
+
+	// 2. Runner-write with a BOGUS token → 401.
+	resp, _ = postAuth(t, ts.URL+"/v1/leases/acquire", "not-a-real-token", acquireBody)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("acquire with bogus token = %d, want 401", resp.StatusCode)
+	}
+
+	// 3. Runner-write with the VALID token → accepted (204 = empty queue, which
+	//    is success: the request passed auth and reached the handler).
+	resp, _ = postAuth(t, ts.URL+"/v1/leases/acquire", reg.RunnerToken, acquireBody)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("acquire with valid token = %d, want 204", resp.StatusCode)
+	}
+
+	// 4. The same valid runner token, presented to a runner-write endpoint of
+	//    another shape (POST /v1/runs), is likewise accepted — proving the token
+	//    is a first-class runner credential across the runner-write group.
+	resp, data = postAuth(t, ts.URL+"/v1/runs", reg.RunnerToken,
+		map[string]any{"project_id": seedProject(t, pool, tenantID), "remote": "origin", "issue_number": 7})
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("create run with valid token = %d, want 201 (%s)", resp.StatusCode, data)
+	}
+}
+
+// seedProject inserts a throwaway project under the given tenant and returns its
+// id — runner-write tests need a project_id that belongs to the bootstrap
+// tenant the runner token resolves to.
+func seedProject(t *testing.T, pool *pgxpool.Pool, tenantID string) string {
+	t.Helper()
+	var id string
+	name := fmt.Sprintf("scope-proj-%d", time.Now().UnixNano())
+	if err := pool.QueryRow(context.Background(),
+		`INSERT INTO project (tenant_id, name, owner_repo) VALUES ($1, $2, 'o/r') RETURNING id::text`,
+		tenantID, name).Scan(&id); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	return id
 }
 
 // TestEgressIngestAndList exercises the §11.6 shipper wire contract end-to-end:
@@ -288,6 +400,17 @@ func TestTenantIsolation(t *testing.T) {
 	tA, pA, rA := seedTenant(fmt.Sprintf("iso-A-%d", stamp))
 	tB, pB, rB := seedTenant(fmt.Sprintf("iso-B-%d", stamp))
 
+	// Mint a runner token for A's runner so the §7(b) runner-write path can be
+	// exercised cross-tenant: the token resolves to tenant A, so presenting it
+	// against B's runner must 404 on the tenant filter. Isolation on runner-write
+	// endpoints now rides the token-derived tenant, not the X-Flow-Tenant-ID
+	// header (the runner-token extractor ignores that header entirely).
+	runnerTokenA := fmt.Sprintf("iso-runner-token-A-%d", stamp)
+	if _, err := pool.Exec(ctx, `UPDATE runner SET token_hash = $1 WHERE id = $2`,
+		auth.HashToken(runnerTokenA), rA); err != nil {
+		t.Fatalf("seed runner token: %v", err)
+	}
+
 	// The Server is constructed with tenant-A as the bootstrap fallback so
 	// requests without a header default to A — proves the test is actually
 	// exercising the explicit header path for B (not falling back).
@@ -334,6 +457,33 @@ func TestTenantIsolation(t *testing.T) {
 		return resp
 	}
 
+	// doToken is the runner-write variant: it authenticates with a §7(b) runner
+	// token bearer instead of the X-Flow-Tenant-ID header. Runner-write endpoints
+	// derive the tenant from the token, so cross-tenant isolation on those routes
+	// is proven by presenting A's token against B's resources.
+	doToken := func(method, path, token string, body any) *http.Response {
+		t.Helper()
+		var buf bytes.Buffer
+		if body != nil {
+			if err := json.NewEncoder(&buf).Encode(body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		req, err := http.NewRequest(method, ts.URL+path, &buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		return resp
+	}
+
 	// 1. GET /v1/runs/{tenant-B-run} with tenant-A header MUST be 404.
 	resp := do(http.MethodGet, "/v1/runs/"+runB, tA, nil)
 	if resp.StatusCode != http.StatusNotFound {
@@ -349,8 +499,10 @@ func TestTenantIsolation(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// 3. PATCH cross-tenant MUST be 404 and MUST NOT mutate the row.
-	resp = do(http.MethodPatch, "/v1/runs/"+runB, tA,
+	// 3. PATCH cross-tenant MUST be 404 and MUST NOT mutate the row. This is a
+	//    runner-write endpoint: A presents its runner token (→ tenant A) against
+	//    B's run; the tenant filter rejects it as not-found.
+	resp = doToken(http.MethodPatch, "/v1/runs/"+runB, runnerTokenA,
 		map[string]any{"current_state": "ATTACKER_WROTE_THIS"})
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("A patches B's run = %d, want 404", resp.StatusCode)
@@ -369,7 +521,7 @@ func TestTenantIsolation(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM run_event WHERE run_id = $1`, runB).Scan(&beforeEvents); err != nil {
 		t.Fatal(err)
 	}
-	resp = do(http.MethodPost, "/v1/runs/"+runB+"/events", tA, map[string]any{
+	resp = doToken(http.MethodPost, "/v1/runs/"+runB+"/events", runnerTokenA, map[string]any{
 		"events": []map[string]any{{"event": "attacker", "data": map[string]string{"x": "y"}}},
 	})
 	if resp.StatusCode != http.StatusNotFound {
@@ -426,18 +578,20 @@ func TestTenantIsolation(t *testing.T) {
 	}
 
 	// 7. Runner heartbeat cross-tenant MUST be 404 (and MUST NOT bump the
-	//    other tenant's runner heartbeat). last_heartbeat is nullable until the
-	//    first heartbeat lands, so use *time.Time and compare via the pointer.
+	//    other tenant's runner heartbeat). This is now a §7(b) runner-write
+	//    endpoint: A presents its runner token (→ tenant A) against B's runner,
+	//    and the handler's tenant filter rejects it. last_heartbeat is nullable
+	//    until the first heartbeat lands, so use *time.Time and compare via the
+	//    pointer.
 	var prevHeartbeat *time.Time
 	if err := pool.QueryRow(ctx,
 		`SELECT last_heartbeat FROM runner WHERE id = $1`, rB).Scan(&prevHeartbeat); err != nil {
 		t.Fatal(err)
 	}
-	resp = do(http.MethodPost, "/v1/runners/"+rB+"/heartbeat", tA, nil)
+	resp, _ = postAuth(t, ts.URL+"/v1/runners/"+rB+"/heartbeat", runnerTokenA, nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("A heartbeats B's runner = %d, want 404", resp.StatusCode)
 	}
-	resp.Body.Close()
 	var newHeartbeat *time.Time
 	if err := pool.QueryRow(ctx,
 		`SELECT last_heartbeat FROM runner WHERE id = $1`, rB).Scan(&newHeartbeat); err != nil {
