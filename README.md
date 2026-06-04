@@ -97,6 +97,41 @@ docker run -d --name flow-test-pg -e POSTGRES_USER=flow -e POSTGRES_PASSWORD=flo
 FLOW_TEST_DSN="postgres://flow:flow@localhost:55432/flow?sslmode=disable" go test ./...
 ```
 
+## `flowctl login` (§7(a) GitHub OAuth device flow)
+
+Ihmiskäyttäjän autentikointi keskukseen tehdään GitHubin **device flowlla**
+(toimii headless-Studiolla SSH:n yli — vain selain ja lyhyt koodi).
+
+**Käyttöönotto (admin, kerran per deploy):**
+
+1. Rekisteröi OAuth App: <https://github.com/settings/developers> → *New OAuth
+   App*. *Callback URL* on device-flow'ssa merkityksetön mutta lomake vaatii
+   sen — laita sinne keskuksen URL. **Device flowlle ei tarvita client_secretiä.**
+2. Aseta `FLOW_GITHUB_OAUTH_CLIENT_ID` keskuksen ympäristöön. Jos jätät
+   tyhjäksi, `/v1/auth/device/*` palauttaa 503 ja muut endpointit toimivat
+   normaalisti.
+
+**Käyttäjän kirjautuminen:**
+
+```sh
+flowctl login
+# 1. Open this URL in a browser:   https://github.com/login/device
+# 2. Enter this code:              ABCD-1234
+# Waiting for authorization (Ctrl+C to cancel)...
+# Signed in as ollisaari.
+# Session token written to ~/.config/flow/credentials (chmod 600).
+```
+
+Session-token kirjoitetaan polkuun `~/.config/flow/credentials` oikeuksilla
+`0600` (override: `XDG_CONFIG_HOME` tai `FLOW_CREDENTIALS_PATH`). Käytä sitä
+muissa `flowctl`-komennoissa: `export FLOW_TOKEN=$(cat ~/.config/flow/credentials)`.
+
+**Mitä keskuksessa tapahtuu:** keskus on OAuth-klientti — raaka GitHub-token
+ei poistu `flowd`:ltä. Token vaihdetaan `app_user`-rivin (tenant_id + GitHub
+login + role) upserttiin ja opaqueen session-tokeniin, jonka SHA-256-hash
+tallennetaan `user_session`-tauluun. Raaka session-token palautuu vain kerran
+`/v1/auth/device/poll`-vastauksessa.
+
 ## Käyttöön liittyvät oletukset (Vaihe 1)
 
 - `flow-runner` ajaa orkestroinnin **in-process** oletuksena (kehityskoneella ei
