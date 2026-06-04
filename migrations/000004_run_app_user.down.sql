@@ -1,0 +1,6 @@
+BEGIN;
+
+DROP INDEX IF EXISTS run_app_user_idx;
+ALTER TABLE run DROP COLUMN IF EXISTS app_user_id;
+
+COMMIT;

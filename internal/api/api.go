@@ -109,6 +109,16 @@ func (s *Server) Routes() http.Handler {
 		mux.Handle(method+" "+pattern, tenant(h))
 	}
 
+	// RBAC-scoped routes (§7): tenant → RequireAuth → RequireRole → handler.
+	// The lookup resolves session tokens to principals; an unauthenticated
+	// request lands on 401 before it can probe the capability.
+	lookup := auth.PrincipalLookupFromPool(s.Pool)
+	rbacScoped := func(method, pattern string, capability auth.Capability, h http.HandlerFunc) {
+		chain := auth.RequireRole(capability)(h)
+		chain = auth.RequireAuth(lookup)(chain)
+		mux.Handle(method+" "+pattern, tenant(chain))
+	}
+
 	// Runner-write endpoints (§7(b) runner-token scope): machine identity,
 	// lease lifecycle, run telemetry. Each REQUIRES a valid runner token.
 	runnerWrite("POST", "/v1/runners/{id}/heartbeat", s.handleRunnerHeartbeat)
@@ -119,10 +129,15 @@ func (s *Server) Routes() http.Handler {
 	runnerWrite("PATCH", "/v1/runs/{id}", s.handleRunPatch)
 	runnerWrite("POST", "/v1/runs/{id}/events", s.handleRunEvents)
 
-	// Read/dashboard endpoints — header extractor (Vaihe 1 stub). The runner
-	// token is NOT a credential here; #7 lands the user-session enforcement.
-	scoped("GET", "/v1/runners", s.handleRunnersList)
-	scoped("GET", "/v1/runs", s.handleRunsList)
+	// Read/dashboard endpoints — RBAC (§7). The runner token is NOT a credential
+	// here; RequireAuth resolves the user session and RequireRole gates the
+	// capability.
+	// §7 row "Hallitsee jaettuja runnereita" — admin-only list.
+	rbacScoped("GET", "/v1/runners", auth.CapRunnersManageShared, s.handleRunnersList)
+	// §7 rows "Näkee omat ajot" / "Näkee koko tenantin ajot" — capability
+	// gates the endpoint; the handler then filters by principal.UserID for
+	// developers (admins see the whole tenant).
+	rbacScoped("GET", "/v1/runs", auth.CapRunsViewOwn, s.handleRunsList)
 	scoped("GET", "/v1/runs/{id}", s.handleRunGet)
 	scoped("GET", "/v1/runs/{id}/logs", s.handleRunLogs) // SSE
 

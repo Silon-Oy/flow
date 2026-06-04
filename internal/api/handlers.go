@@ -320,14 +320,24 @@ func (s *Server) handleRunsList(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := withTimeout(r, 5*time.Second)
 	defer cancel()
 	statusFilter := r.URL.Query().Get("status")
+
+	// §7 visibility filter. Admin sees the whole tenant; developer sees only
+	// runs they own. Pre-RBAC rows (app_user_id IS NULL) stay admin-only — a
+	// developer cannot inherit unattributed runs by guessing a user_id.
+	p, _ := auth.PrincipalFromContext(r.Context())
+	ownerFilter := ""
+	if p.Role != auth.RoleAdmin {
+		ownerFilter = p.UserID
+	}
 	rows, err := s.Pool.Query(ctx, `
 		SELECT id::text, project_id::text, remote, issue_number, status,
 		       current_state, branch, pr_url, started_at, finished_at
 		  FROM run
 		 WHERE tenant_id = $1
 		   AND ($2 = '' OR status::text = $2)
+		   AND ($3 = '' OR app_user_id::text = $3)
 		 ORDER BY started_at DESC
-		 LIMIT 200`, tenantID, statusFilter)
+		 LIMIT 200`, tenantID, statusFilter, ownerFilter)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
