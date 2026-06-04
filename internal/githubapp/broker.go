@@ -155,6 +155,10 @@ func (b *Broker) lookupInstall(ctx context.Context, tenantID, org string) (*inst
 
 // mintInstallationToken hits POST /app/installations/{id}/access_tokens with
 // an App-JWT bearer. The HTTP contract matches GitHub's documented endpoint.
+//
+// Returned errors are wrapped with cause detail so the handler's server-side
+// log carries the diagnosis; the handler is responsible for not propagating
+// these strings into the HTTP response body (it logs + writes a generic 502).
 func (b *Broker) mintInstallationToken(ctx context.Context, inst *installation, now time.Time) (*Token, error) {
 	pemBytes, err := b.res.Resolve(inst.PrivateKeyRef)
 	if err != nil {

@@ -92,17 +92,29 @@ func TestGitHubAppTokenIntegration(t *testing.T) {
 	t.Setenv(keyRef, pemKey(t))
 	seedAppInstall(t, pool, tenantID, "acme", keyRef, 1001, 2002)
 
+	const brokerToken = "test-broker-token-abc123"
+
+	// authedGet issues a GET with the broker bearer attached. A plain
+	// http.Get hits the unauthenticated path (covered separately).
+	authedGet := func(url string) *http.Response {
+		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		req.Header.Set("Authorization", "Bearer "+brokerToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
 	srv := New(pool, tenantID)
+	srv.BrokerToken = brokerToken
 	srv.GHApp = githubapp.NewBroker(pool, secrets.EnvResolver{}).
 		WithHTTPClient(fake.Client()).WithAPIBase(fake.URL)
 	ts := httptest.NewServer(srv.Routes())
 	t.Cleanup(ts.Close)
 
-	t.Run("OK", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/v1/github-app/token?org=acme")
-		if err != nil {
-			t.Fatal(err)
-		}
+	t.Run("OK with bearer", func(t *testing.T) {
+		resp := authedGet(ts.URL + "/v1/github-app/token?org=acme")
 		body := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status %d: %s", resp.StatusCode, body)
@@ -122,11 +134,32 @@ func TestGitHubAppTokenIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("missing org → 400", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/v1/github-app/token")
+	t.Run("no bearer → 401", func(t *testing.T) {
+		resp, err := http.Get(ts.URL + "/v1/github-app/token?org=acme")
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("status %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("wrong bearer → 401", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/github-app/token?org=acme", nil)
+		req.Header.Set("Authorization", "Bearer wrong-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("status %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("missing org → 400", func(t *testing.T) {
+		resp := authedGet(ts.URL + "/v1/github-app/token")
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("status %d, want 400", resp.StatusCode)
@@ -134,13 +167,26 @@ func TestGitHubAppTokenIntegration(t *testing.T) {
 	})
 
 	t.Run("unknown org → 404", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/v1/github-app/token?org=nope")
-		if err != nil {
-			t.Fatal(err)
-		}
+		resp := authedGet(ts.URL + "/v1/github-app/token?org=nope")
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("status %d, want 404", resp.StatusCode)
+		}
+	})
+
+	t.Run("broker disabled → 503", func(t *testing.T) {
+		// Spin up a fresh server with no BrokerToken set: even with bearer,
+		// the central refuses to mint (fail-closed default).
+		bare := New(pool, tenantID)
+		bare.BrokerToken = "" // explicit: ignore whatever the env held
+		bare.GHApp = srv.GHApp
+		bareTS := httptest.NewServer(bare.Routes())
+		t.Cleanup(bareTS.Close)
+
+		resp := authedGet(bareTS.URL + "/v1/github-app/token?org=acme")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("status %d, want 503", resp.StatusCode)
 		}
 	})
 }
