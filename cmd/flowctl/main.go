@@ -29,6 +29,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "flowctl login:", err)
 			os.Exit(1)
 		}
+	case "init":
+		if err := runInit(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "flowctl init:", err)
+			os.Exit(1)
+		}
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -43,6 +48,7 @@ func usage() {
 
 Usage:
   flowctl login                       sign in via GitHub OAuth device flow
+  flowctl init [--config flow.yaml]   register a project (§8 wizard)
   flowctl status [--status <run-status>]
 
 Env:
