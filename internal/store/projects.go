@@ -171,6 +171,34 @@ func GetProject(ctx context.Context, pool *pgxpool.Pool, tenantID, id string) (*
 // has no row. Callers (HTTP layer) map this to 404.
 var ErrProjectNotFound = errors.New("project: not found")
 
+// UpdateMergePolicy writes the merge_policy column on a tenant-scoped project.
+// Returns ErrProjectNotFound if the (tenant_id, id) pair has no row — the
+// handler maps that to 404 without leaking existence across tenants. The
+// payload is jsonb so the value passes through as a JSON object; structural
+// validation is the caller's job.
+func UpdateMergePolicy(ctx context.Context, pool *pgxpool.Pool, tenantID, id string, policy map[string]any) error {
+	if tenantID == "" || id == "" {
+		return errors.New("store: tenant_id and id required")
+	}
+	mergeJSON, err := json.Marshal(coalesceMap(policy))
+	if err != nil {
+		return fmt.Errorf("encode merge_policy: %w", err)
+	}
+	tag, err := pool.Exec(ctx, `
+		UPDATE project
+		   SET merge_policy = $3::jsonb
+		 WHERE tenant_id = $1 AND id = $2`,
+		tenantID, id, mergeJSON,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrProjectNotFound
+	}
+	return nil
+}
+
 func coalesceRemotes(in []ProjectRemote) []ProjectRemote {
 	if in == nil {
 		return []ProjectRemote{}

@@ -151,6 +151,9 @@ func (s *Server) Routes() http.Handler {
 	// inserting (acceptance criterion: validation lives in the central, not
 	// just in the CLI).
 	rbacScoped("POST", "/v1/projects", auth.CapProjectRegister, s.handleProjectCreate)
+	// §7 row "Muokkaa merge-policya" — admin-only. The dashboard's merge-policy
+	// form submits here; developers receive 403.
+	rbacScoped("PUT", "/v1/projects/{id}/merge-policy", auth.CapMergePolicyManage, s.handleProjectMergePolicy)
 	// §7 row "Hallitsee jaettuja runnereita" — admin-only list.
 	rbacScoped("GET", "/v1/runners", auth.CapRunnersManageShared, s.handleRunnersList)
 	// §7 rows "Näkee omat ajot" / "Näkee koko tenantin ajot" — capability
