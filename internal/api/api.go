@@ -32,6 +32,18 @@ type Server struct {
 	Runs   *runstate.Store
 	Auth   *auth.Service
 	GHApp  *githubapp.Broker
+	// Secrets is the per-store dispatch table (§9). Env-only deploys carry an
+	// EnvResolver; deploys that have set FLOW_SECRETS_DB_KEY get a paired
+	// PGCryptoResolver. Handlers MUST go through this rather than reach for a
+	// bare resolver so the per-row `store` column actually controls the
+	// backend.
+	Secrets *secrets.Registry
+	// SecretsKey is the symmetric key the central uses to encrypt new secret
+	// values (pgp_sym_encrypt) at POST /v1/secrets time. It mirrors the key
+	// the PGCryptoResolver decrypts with. Empty => POST /v1/secrets returns
+	// 503 (no postgres-backed store available); EnvResolver-only deploys
+	// keep working since they never hit this code path.
+	SecretsKey []byte
 	// TenantID is the bootstrap tenant fed to the Vaihe 1 header-stub extractor:
 	// requests that omit X-Flow-Tenant-ID fall back to this so the existing
 	// single-tenant clients (and tests) keep working. The scanner (system-level,
@@ -49,7 +61,9 @@ type Server struct {
 //
 // The GitHub App broker is wired with the env-backed secrets resolver: Vaihe 1
 // reads `private_key_ref` as an env var name, issue #10 swaps it for a
-// pgcrypto resolver behind the same interface.
+// pgcrypto resolver behind the same interface. The PGCryptoResolver itself is
+// initialised only when FLOW_SECRETS_DB_KEY is set; absent => env-only Registry
+// (Vaihe 1 behaviour preserved, fail-closed on store='postgres' calls).
 //
 // BrokerToken is the shared bearer that gates /v1/github-app/token. Issue #6
 // landed per-runner tokens on the runner-write endpoints, but this broker
@@ -58,12 +72,21 @@ type Server struct {
 // never mints App tokens for unauthenticated callers, even on a private
 // network).
 func New(pool *pgxpool.Pool, tenantID string) *Server {
+	secretsKey := []byte(os.Getenv("FLOW_SECRETS_DB_KEY"))
+	registry := &secrets.Registry{
+		Env: secrets.EnvResolver{},
+	}
+	if len(secretsKey) > 0 {
+		registry.Pg = &secrets.PGCryptoResolver{Pool: pool, Key: secretsKey}
+	}
 	return &Server{
 		Pool:        pool,
 		Leases:      lease.NewManager(pool),
 		Runs:        runstate.New(pool),
 		Auth:        auth.New(pool, tenantID, os.Getenv("FLOW_GITHUB_OAUTH_CLIENT_ID")),
 		GHApp:       githubapp.NewBroker(pool, secrets.EnvResolver{}),
+		Secrets:     registry,
+		SecretsKey:  secretsKey,
 		TenantID:    tenantID,
 		BrokerToken: os.Getenv("FLOW_BROKER_TOKEN"),
 		hub:         newLogHub(),
@@ -140,6 +163,13 @@ func (s *Server) Routes() http.Handler {
 	rbacScoped("GET", "/v1/runs", auth.CapRunsViewOwn, s.handleRunsList)
 	scoped("GET", "/v1/runs/{id}", s.handleRunGet)
 	scoped("GET", "/v1/runs/{id}/logs", s.handleRunLogs) // SSE
+
+	// §7 row "Asettaa/muokkaa secretsejä" — admin-only secrets broker write.
+	// Issue #10: pgcrypto-backed store, raw value encrypted at this seam and
+	// never logged. Read isn't gated yet because callers (lease materialiser)
+	// query secret_ref directly server-side; an admin-facing GET will land
+	// alongside the flowctl admin CLI.
+	rbacScoped("POST", "/v1/secrets", auth.CapSecretsManage, s.handleSecretCreate)
 
 	// Egress log read (dashboard). POST is system-level (see above), GET is
 	// tenant-scoped so dashboards never read across tenants.

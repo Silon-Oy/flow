@@ -17,7 +17,10 @@ package runnerexec
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+
+	"github.com/Silon-Oy/flow/internal/secrets"
 )
 
 // Spec describes a single hardened run.
@@ -40,6 +43,15 @@ type Spec struct {
 	// The container stages it into $HOME/.claude/.credentials.json itself; it is
 	// never an env var and never crosses to the central service.
 	ClaudeCredHostPath string
+
+	// Env carries lease-scoped secrets resolved from secret_ref rows whose
+	// delivery='env' (§9). They become -e KEY=VALUE flags in docker run. The
+	// central is the producer (POST /v1/leases/acquire); the runner just hands
+	// the map to Spec without inspecting it. §11.3 defense-in-depth: forbidden
+	// keys (GITHUB_TOKEN, GH_TOKEN) are silently dropped at render time so a
+	// future code path that bypasses the API validator still cannot leak GH
+	// credentials into the container.
+	Env map[string]string
 
 	MemoryLimit string // e.g. "2g"
 	CPULimit    string // e.g. "2"
@@ -99,6 +111,18 @@ func (s Spec) DockerArgs() []string {
 		args = append(args, "-e", "FLOW_RUNNER_TOKEN="+s.CentralToken)
 	}
 
+	// Lease-scoped secret env (§9). Sorted keys for deterministic argv (testable,
+	// and avoids order-noise in audit logs). Forbidden keys are dropped silently:
+	// the API validator already rejects them at write time; the second filter
+	// here is defense-in-depth so a future code path that bypasses the API still
+	// cannot leak GH credentials into the container.
+	for _, k := range sortedKeys(s.Env) {
+		if secrets.IsForbiddenEnvKey(k) {
+			continue
+		}
+		args = append(args, "-e", k+"="+s.Env[k])
+	}
+
 	// Claude credential as a read-only file mount (Model B). The credential is a
 	// FILE, never an env var, and the central service never sees it (§11.5/§12).
 	if s.ClaudeCredHostPath != "" {
@@ -126,4 +150,16 @@ func HasForbiddenMounts(args []string) bool {
 		}
 	}
 	return false
+}
+
+func sortedKeys(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

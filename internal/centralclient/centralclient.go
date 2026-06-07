@@ -87,19 +87,25 @@ func (c *Client) RunnerHeartbeat(ctx context.Context, runnerID string) error {
 }
 
 // AcquireResult carries the acquire outcome. Acquired is false when the queue
-// is empty (204) — the runner backs off; it is NOT an error.
+// is empty (204) — the runner backs off; it is NOT an error. Env carries the
+// materialised delivery='env' secrets the central resolved for this lease
+// (§9); the runner forwards it to runnerexec.Spec.Env so each per-run
+// container sees its scoped env without the runner ever reading secret_value
+// rows itself.
 type AcquireResult struct {
 	Acquired bool
 	Lease    *lease.Lease
 	Work     *lease.Work
+	Env      map[string]string
 }
 
 // Acquire attempts to claim work. A 204 (empty queue) returns Acquired=false,
 // nil error. A transport/DB error propagates so the runner fails closed.
 func (c *Client) Acquire(ctx context.Context, runnerID string, kinds []string) (AcquireResult, error) {
 	var out struct {
-		Lease *lease.Lease `json:"lease"`
-		Work  *lease.Work  `json:"work"`
+		Lease *lease.Lease      `json:"lease"`
+		Work  *lease.Work       `json:"work"`
+		Env   map[string]string `json:"env,omitempty"`
 	}
 	code, err := c.do(ctx, http.MethodPost, "/v1/leases/acquire",
 		map[string]any{"runner_id": runnerID, "kinds": kinds}, &out)
@@ -109,7 +115,7 @@ func (c *Client) Acquire(ctx context.Context, runnerID string, kinds []string) (
 	if code == http.StatusNoContent {
 		return AcquireResult{Acquired: false}, nil
 	}
-	return AcquireResult{Acquired: true, Lease: out.Lease, Work: out.Work}, nil
+	return AcquireResult{Acquired: true, Lease: out.Lease, Work: out.Work, Env: out.Env}, nil
 }
 
 // LeaseHeartbeat extends a lease. Returns an error (HTTP 409) if the lease is no

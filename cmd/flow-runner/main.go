@@ -178,7 +178,7 @@ func pullAndRun(ctx context.Context, cli *centralclient.Client, runnerID, repoRo
 	// trusted runner; the untrusted orchestrator container never gets it).
 	// FLOW_RUNNER_MODE=container selects the sandboxed path; default is inproc.
 	if mode == "container" {
-		return runInContainer(runCtx, cli, work, runID, branch, repoRoot, central)
+		return runInContainer(runCtx, cli, work, runID, branch, repoRoot, central, acq.Env)
 	}
 
 	// Fetch issue body + comments + image URLs on the trusted host BEFORE
@@ -220,7 +220,7 @@ func pullAndRun(ctx context.Context, cli *centralclient.Client, runnerID, repoRo
 // in-container orchestrator reports them itself via centralclient (FLOW_CENTRAL_URL
 // + FLOW_RUNNER_TOKEN passed in env by runnerexec.Spec). On container exit we
 // log the result; the run's terminal status is whatever the container PATCHed.
-func runInContainer(ctx context.Context, cli *centralclient.Client, work *lease.Work, runID, branch, repoRoot, central string) error {
+func runInContainer(ctx context.Context, cli *centralclient.Client, work *lease.Work, runID, branch, repoRoot, central string, leaseEnv map[string]string) error {
 	// S4 (host-side): fetch the remote and create the per-run worktree. The
 	// orchestrator inside the container will see this as /work and skip its own
 	// worktree.Create (Config.WorktreePath is non-empty).
@@ -246,8 +246,13 @@ func runInContainer(ctx context.Context, cli *centralclient.Client, work *lease.
 		CentralURL:         central,
 		CentralToken:       cli.Token,
 		ClaudeCredHostPath: os.Getenv("FLOW_CLAUDE_CRED_PATH"),
-		MemoryLimit:        envOr("FLOW_CONTAINER_MEMORY", ""),
-		CPULimit:           envOr("FLOW_CONTAINER_CPUS", ""),
+		// §9 delivery='env' secrets resolved by the central at lease-acquire
+		// time. The runner never reads secret_value rows itself; it just
+		// forwards the materialised map. §11.3 defense-in-depth filtering of
+		// GITHUB_TOKEN/GH_TOKEN lives in runnerexec.DockerArgs().
+		Env:         leaseEnv,
+		MemoryLimit: envOr("FLOW_CONTAINER_MEMORY", ""),
+		CPULimit:    envOr("FLOW_CONTAINER_CPUS", ""),
 	}
 
 	// Defensive guard: the §11.1 invariant test owns the same assertion, but a
