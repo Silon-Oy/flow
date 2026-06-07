@@ -19,10 +19,14 @@ const (
 // A request without a Principal is unauthenticated — handlers that need a
 // user-bound identity (e.g. "developer sees own runs") MUST gate on
 // PrincipalFromContext and refuse the call when ok is false.
+//
+// GitHubLogin is the human-readable name surfaced by /v1/me to the dashboard
+// header — it's never an authorization signal, only an identity label.
 type Principal struct {
-	TenantID string
-	UserID   string
-	Role     Role
+	TenantID    string
+	UserID      string
+	Role        Role
+	GitHubLogin string
 }
 
 type principalCtxKeyT struct{}
