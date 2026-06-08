@@ -11,6 +11,7 @@ import (
 	"github.com/Silon-Oy/flow/internal/auth"
 	"github.com/Silon-Oy/flow/internal/lease"
 	"github.com/Silon-Oy/flow/internal/runstate"
+	"github.com/Silon-Oy/flow/internal/secrets"
 )
 
 // --- runners ---------------------------------------------------------------
@@ -129,9 +130,14 @@ type leaseAcquireReq struct {
 	Kinds    []string `json:"kinds"`
 }
 
+// leaseAcquireResp ships the lease, the work it authorises, and the materialised
+// env-delivery secrets (§9). Env is omitempty so the wire stays unchanged for
+// tenants with no delivery='env' secret_refs — existing centralclient consumers
+// see no diff.
 type leaseAcquireResp struct {
-	Lease *lease.Lease `json:"lease"`
-	Work  *lease.Work  `json:"work"`
+	Lease *lease.Lease      `json:"lease"`
+	Work  *lease.Work       `json:"work"`
+	Env   map[string]string `json:"env,omitempty"`
 }
 
 func (s *Server) handleLeaseAcquire(w http.ResponseWriter, r *http.Request) {
@@ -163,7 +169,21 @@ func (s *Server) handleLeaseAcquire(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "lease acquire failed: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, leaseAcquireResp{Lease: l, Work: work})
+
+	// §9: materialise delivery='env' secrets for this tenant into the lease
+	// response. Fail-closed: if a delivery='env' row cannot be resolved (missing
+	// env var, wrong key, etc.) we release the lease and surface 503 rather than
+	// hand the runner a partial environment — silently dropping a configured
+	// secret would mask a real misconfiguration. The lease release here mirrors
+	// the cleanup the runner would do on error, so the work returns to the queue.
+	env, err := secrets.MaterializeAllEnvForTenant(ctx, s.Pool, s.Secrets, tenantID)
+	if err != nil {
+		// Best-effort release; the reaper will catch it if this fails too.
+		_ = s.Leases.Release(ctx, tenantID, l.ID)
+		writeErr(w, http.StatusServiceUnavailable, "secrets materialise failed: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, leaseAcquireResp{Lease: l, Work: work, Env: env})
 }
 
 func (s *Server) handleLeaseHeartbeat(w http.ResponseWriter, r *http.Request) {
