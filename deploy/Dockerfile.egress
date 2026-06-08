@@ -1,0 +1,28 @@
+# egress-proxy — runner-host default-deny egress allow-list (§11.2/§11.6).
+#
+# Built on the maintained ubuntu/squid image, which provides squid + an
+# entrypoint that forwards access.log to stdout. That stock image lacks
+# iptables/ipset and its entrypoint treats `command` as squid args, so it
+# cannot run the firewall on its own (see flow-egress-entrypoint.sh). This
+# image adds the firewall tooling, bakes in the config + init script, and runs
+# the firewall before squid starts.
+#
+# Requires `--cap-add=NET_ADMIN` at runtime (set in docker-compose.yml) so the
+# init script can program iptables/ipset inside the container netns.
+FROM ubuntu/squid:latest
+
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends iptables ipset \
+ && rm -rf /var/lib/apt/lists/*
+
+# §11.2 allow-list firewall + the proxy config (kept in sync per squid.conf).
+COPY deploy/egress-proxy/init-firewall.sh /usr/local/bin/init-firewall.sh
+COPY deploy/egress-proxy/flow-egress-entrypoint.sh /usr/local/bin/flow-egress-entrypoint.sh
+COPY deploy/egress-proxy/squid.conf /etc/squid/squid.conf
+RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/flow-egress-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/flow-egress-entrypoint.sh"]
+# Squid args passed through to the stock entrypoint: foreground (-N), the Flow
+# config, and Ubuntu's -YC flags (mimics the systemd unit).
+CMD ["-f", "/etc/squid/squid.conf", "-NYC"]
