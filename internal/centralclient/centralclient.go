@@ -274,6 +274,45 @@ func (c *Client) PollDeviceLogin(ctx context.Context, deviceCode string) (*Devic
 	return &out, nil
 }
 
+// --- §8 PROJECT wizard -----------------------------------------------------
+
+// ProjectRemote mirrors the wire shape POST /v1/projects expects on each
+// remotes[] entry. base_branch is optional per päätös 14 (per-remote override
+// of PROJECT.base_branch).
+type ProjectRemote struct {
+	Remote     string `json:"remote"`
+	OwnerRepo  string `json:"owner_repo"`
+	BaseBranch string `json:"base_branch,omitempty"`
+}
+
+// CreateProjectRequest is what the CLI sends to POST /v1/projects. Optional
+// fields are omitempty so the wizard can leave them at server-side defaults
+// (labels=["auto-run"], base_branch="main").
+type CreateProjectRequest struct {
+	Name                 string            `json:"name"`
+	OwnerRepo            string            `json:"owner_repo"`
+	Remotes              []ProjectRemote   `json:"remotes,omitempty"`
+	Labels               []string          `json:"labels,omitempty"`
+	BaseBranch           string            `json:"base_branch,omitempty"`
+	RunnerPool           string            `json:"runner_pool,omitempty"`
+	ClaudeTimeoutSeconds int               `json:"claude_timeout_seconds,omitempty"`
+	MergePolicy          map[string]any    `json:"merge_policy,omitempty"`
+	SecretRefs           map[string]string `json:"secret_refs,omitempty"`
+}
+
+// CreateProject calls POST /v1/projects and returns the new project id. The
+// central performs the §8 validation (regex, App-install, branch existence);
+// the CLI uses any HTTP-level error message verbatim — it's the diagnostic.
+func (c *Client) CreateProject(ctx context.Context, req CreateProjectRequest) (string, error) {
+	var out struct {
+		ProjectID string `json:"project_id"`
+	}
+	if _, err := c.do(ctx, http.MethodPost, "/v1/projects", req, &out); err != nil {
+		return "", err
+	}
+	return out.ProjectID, nil
+}
+
 // --- §7.3 GitHub App token broker ------------------------------------------
 
 // GitHubAppToken is what the central returns from /v1/github-app/token. The

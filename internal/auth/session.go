@@ -52,10 +52,10 @@ func PrincipalLookupFromPool(pool pgxQuerier) PrincipalLookup {
 			       AND expires_at > now()
 			    RETURNING user_id
 			)
-			SELECT u.tenant_id::text, u.id::text, u.role::text
+			SELECT u.tenant_id::text, u.id::text, u.role::text, u.github_login
 			  FROM bumped b
 			  JOIN app_user u ON u.id = b.user_id
-		`, tokenHash).Scan(&p.TenantID, &p.UserID, &roleStr)
+		`, tokenHash).Scan(&p.TenantID, &p.UserID, &roleStr, &p.GitHubLogin)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Principal{}, ErrSessionInvalid
 		}

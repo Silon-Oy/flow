@@ -84,3 +84,36 @@ func RoleAllows(role Role, cap Capability) bool {
 	}
 	return caps[cap]
 }
+
+// allCapabilities lists every defined capability in the §7 row order. The
+// dashboard's /v1/me endpoint reflects this list back to the browser so the UI
+// can render role-aware controls without hard-coding role→capability mappings
+// client-side; adding a row to the §7 table = appending to this list and to
+// roleCapabilities.
+var allCapabilities = []Capability{
+	CapProjectRegister,
+	CapRunsViewOwn,
+	CapRunsViewTenant,
+	CapRunnerRegisterSelf,
+	CapRunnersManageShared,
+	CapSecretsManage,
+	CapMergePolicyManage,
+	CapGitHubAppManage,
+}
+
+// CapabilitiesFor returns every capability granted to role, in the §7 table
+// order. Used by /v1/me to project the role-allows table onto the wire so the
+// dashboard can branch on capabilities, not on role strings. Unknown roles
+// return nil.
+func CapabilitiesFor(role Role) []Capability {
+	if _, ok := roleCapabilities[role]; !ok {
+		return nil
+	}
+	out := make([]Capability, 0, len(allCapabilities))
+	for _, c := range allCapabilities {
+		if RoleAllows(role, c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}

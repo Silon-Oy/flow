@@ -8,6 +8,39 @@ import (
 	"github.com/Silon-Oy/flow/internal/auth"
 )
 
+// meResp is the wire shape of GET /v1/me. The dashboard reads it on load to
+// branch on role/capabilities and to surface the signed-in user's GitHub login
+// in the header. capabilities[] is the explicit projection of the §7
+// role-limits table so the UI never has to hard-code role→capability mappings.
+type meResp struct {
+	UserID       string   `json:"user_id"`
+	GitHubLogin  string   `json:"github_login"`
+	Role         string   `json:"role"`
+	Capabilities []string `json:"capabilities"`
+}
+
+// handleMe returns the resolved principal of the request. RequireAuth has
+// already pinned it; if it's missing here the middleware chain is mis-wired,
+// so 401 (not 500) — the failure mode mirrors what a token-less call would see.
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	p, ok := auth.PrincipalFromContext(r.Context())
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	caps := auth.CapabilitiesFor(p.Role)
+	out := meResp{
+		UserID:       p.UserID,
+		GitHubLogin:  p.GitHubLogin,
+		Role:         string(p.Role),
+		Capabilities: make([]string, 0, len(caps)),
+	}
+	for _, c := range caps {
+		out.Capabilities = append(out.Capabilities, string(c))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 // authDeviceStartResp matches the user-visible payload flowctl reads to decide
 // what URL + code to print and how fast to poll.
 type authDeviceStartResp struct {

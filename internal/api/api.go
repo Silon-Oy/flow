@@ -51,6 +51,11 @@ type Server struct {
 	TenantID    string
 	BrokerToken string // pre-shared bearer for §7.3 token broker (FLOW_BROKER_TOKEN)
 
+	// BranchValidator validates per-remote base_branch existence on POST
+	// /v1/projects (§8 wizard). Default is the broker-backed validator; tests
+	// inject a stub so they don't need a live GitHub.
+	BranchValidator BranchValidator
+
 	// hub fans out run events to SSE subscribers.
 	hub *logHub
 }
@@ -79,17 +84,19 @@ func New(pool *pgxpool.Pool, tenantID string) *Server {
 	if len(secretsKey) > 0 {
 		registry.Pg = &secrets.PGCryptoResolver{Pool: pool, Key: secretsKey}
 	}
+	broker := githubapp.NewBroker(pool, secrets.EnvResolver{})
 	return &Server{
-		Pool:        pool,
-		Leases:      lease.NewManager(pool),
-		Runs:        runstate.New(pool),
-		Auth:        auth.New(pool, tenantID, os.Getenv("FLOW_GITHUB_OAUTH_CLIENT_ID")),
-		GHApp:       githubapp.NewBroker(pool, secrets.EnvResolver{}),
-		Secrets:     registry,
-		SecretsKey:  secretsKey,
-		TenantID:    tenantID,
-		BrokerToken: os.Getenv("FLOW_BROKER_TOKEN"),
-		hub:         newLogHub(),
+		Pool:            pool,
+		Leases:          lease.NewManager(pool),
+		Runs:            runstate.New(pool),
+		Auth:            auth.New(pool, tenantID, os.Getenv("FLOW_GITHUB_OAUTH_CLIENT_ID")),
+		GHApp:           broker,
+		Secrets:         registry,
+		SecretsKey:      secretsKey,
+		TenantID:        tenantID,
+		BrokerToken:     os.Getenv("FLOW_BROKER_TOKEN"),
+		BranchValidator: NewBranchValidator(broker),
+		hub:             newLogHub(),
 	}
 }
 
@@ -141,6 +148,13 @@ func (s *Server) Routes() http.Handler {
 		chain = auth.RequireAuth(lookup)(chain)
 		mux.Handle(method+" "+pattern, tenant(chain))
 	}
+	// authedScoped is the "any authenticated user" variant: tenant → RequireAuth
+	// → handler. No capability gate — used for /v1/me where every authenticated
+	// caller is entitled to read their own identity.
+	authedScoped := func(method, pattern string, h http.HandlerFunc) {
+		chain := auth.RequireAuth(lookup)(h)
+		mux.Handle(method+" "+pattern, tenant(chain))
+	}
 
 	// Runner-write endpoints (§7(b) runner-token scope): machine identity,
 	// lease lifecycle, run telemetry. Each REQUIRES a valid runner token.
@@ -155,6 +169,14 @@ func (s *Server) Routes() http.Handler {
 	// Read/dashboard endpoints — RBAC (§7). The runner token is NOT a credential
 	// here; RequireAuth resolves the user session and RequireRole gates the
 	// capability.
+	// §7 row "Rekisteröi projekti (wizard)" — `flowctl init`. Both admin and
+	// developer hold CapProjectRegister; the central validates §8 before
+	// inserting (acceptance criterion: validation lives in the central, not
+	// just in the CLI).
+	rbacScoped("POST", "/v1/projects", auth.CapProjectRegister, s.handleProjectCreate)
+	// §7 row "Muokkaa merge-policya" — admin-only. The dashboard's merge-policy
+	// form submits here; developers receive 403.
+	rbacScoped("PUT", "/v1/projects/{id}/merge-policy", auth.CapMergePolicyManage, s.handleProjectMergePolicy)
 	// §7 row "Hallitsee jaettuja runnereita" — admin-only list.
 	rbacScoped("GET", "/v1/runners", auth.CapRunnersManageShared, s.handleRunnersList)
 	// §7 rows "Näkee omat ajot" / "Näkee koko tenantin ajot" — capability
@@ -174,6 +196,11 @@ func (s *Server) Routes() http.Handler {
 	// Egress log read (dashboard). POST is system-level (see above), GET is
 	// tenant-scoped so dashboards never read across tenants.
 	scoped("GET", "/v1/egress", s.handleEgressList)
+
+	// /v1/me — every authenticated user reads their own identity (no capability
+	// gate). The dashboard polls this on load to branch on role/capabilities and
+	// to render the signed-in user's name in the header.
+	authedScoped("GET", "/v1/me", s.handleMe)
 
 	// Human auth: §7(a) GitHub OAuth device flow. Unauthenticated by design —
 	// they are the bootstrap path that produces the session token everything
