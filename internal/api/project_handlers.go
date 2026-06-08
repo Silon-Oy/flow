@@ -348,6 +348,80 @@ func buildProjectInsert(tenantID string, req *projectCreateReq) store.ProjectIns
 	}
 }
 
+// mergePolicyReq is the wire shape PUT /v1/projects/{id}/merge-policy accepts.
+// §8 lists two known fields (label + conflict-flag); extra keys are rejected so
+// typos surface immediately rather than silently disappearing into jsonb.
+//
+//   - label: the GitHub PR label that signals "ready to merge" (e.g.
+//     "auto-merge"). Matches prwatch.Decide's mergeLabel argument. Optional;
+//     prwatch defaults to "auto-merge" when empty.
+//   - conflict_resolution: when true, BEHIND/DIRTY PRs are auto-rebased
+//     (prwatch returns REBASE instead of WAIT_DIRTY). Optional; default false.
+type mergePolicyReq struct {
+	Label              *string `json:"label,omitempty"`
+	ConflictResolution *bool   `json:"conflict_resolution,omitempty"`
+}
+
+// mergePolicyResp echoes the persisted policy. The handler returns the value
+// it wrote so the dashboard's form can rerender from the canonical state.
+type mergePolicyResp struct {
+	MergePolicy map[string]any `json:"merge_policy"`
+}
+
+// handleProjectMergePolicy is PUT /v1/projects/{id}/merge-policy. RBAC:
+// CapMergePolicyManage (admin-only — §7 row "Muokkaa merge-policya"). The
+// tenant filter on store.UpdateMergePolicy guarantees an admin in tenant A
+// cannot rewrite tenant B's policy even with a guessed id.
+func (s *Server) handleProjectMergePolicy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !uuidRegex.MatchString(id) {
+		writeErr(w, http.StatusBadRequest, "id must be a uuid")
+		return
+	}
+	var req mergePolicyReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	tenantID := tenantFromCtx(r.Context())
+	if tenantID == "" {
+		writeErr(w, http.StatusInternalServerError, "tenant not pinned")
+		return
+	}
+
+	policy := map[string]any{}
+	if req.Label != nil {
+		label := strings.TrimSpace(*req.Label)
+		// branchNameRegex is conservative enough for a GitHub label slug too —
+		// labels with whitespace/quotes break `gh pr view` jq lookups anyway.
+		// Empty string is allowed: it means "reset to prwatch default".
+		if label != "" && !branchNameRegex.MatchString(label) {
+			writeErr(w, http.StatusBadRequest, "label contains invalid characters")
+			return
+		}
+		if len(label) > 64 {
+			writeErr(w, http.StatusBadRequest, "label too long (max 64)")
+			return
+		}
+		policy["label"] = label
+	}
+	if req.ConflictResolution != nil {
+		policy["conflict_resolution"] = *req.ConflictResolution
+	}
+
+	ctx, cancel := withTimeout(r, 5*time.Second)
+	defer cancel()
+	if err := store.UpdateMergePolicy(ctx, s.Pool, tenantID, id, policy); err != nil {
+		if errors.Is(err, store.ErrProjectNotFound) {
+			writeErr(w, http.StatusNotFound, "unknown project")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "update merge_policy: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, mergePolicyResp{MergePolicy: policy})
+}
+
 // hasSecretLikePrefix is a cheap heuristic: token formats we *know* are
 // secrets must not appear as a secret_refs value. Belt-and-braces; the real
 // invariant is enforced by the secret_refs schema (a key, never a value).

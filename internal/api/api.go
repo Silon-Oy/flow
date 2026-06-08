@@ -125,6 +125,13 @@ func (s *Server) Routes() http.Handler {
 		chain = auth.RequireAuth(lookup)(chain)
 		mux.Handle(method+" "+pattern, tenant(chain))
 	}
+	// authedScoped is the "any authenticated user" variant: tenant → RequireAuth
+	// → handler. No capability gate — used for /v1/me where every authenticated
+	// caller is entitled to read their own identity.
+	authedScoped := func(method, pattern string, h http.HandlerFunc) {
+		chain := auth.RequireAuth(lookup)(h)
+		mux.Handle(method+" "+pattern, tenant(chain))
+	}
 
 	// Runner-write endpoints (§7(b) runner-token scope): machine identity,
 	// lease lifecycle, run telemetry. Each REQUIRES a valid runner token.
@@ -144,6 +151,9 @@ func (s *Server) Routes() http.Handler {
 	// inserting (acceptance criterion: validation lives in the central, not
 	// just in the CLI).
 	rbacScoped("POST", "/v1/projects", auth.CapProjectRegister, s.handleProjectCreate)
+	// §7 row "Muokkaa merge-policya" — admin-only. The dashboard's merge-policy
+	// form submits here; developers receive 403.
+	rbacScoped("PUT", "/v1/projects/{id}/merge-policy", auth.CapMergePolicyManage, s.handleProjectMergePolicy)
 	// §7 row "Hallitsee jaettuja runnereita" — admin-only list.
 	rbacScoped("GET", "/v1/runners", auth.CapRunnersManageShared, s.handleRunnersList)
 	// §7 rows "Näkee omat ajot" / "Näkee koko tenantin ajot" — capability
@@ -156,6 +166,11 @@ func (s *Server) Routes() http.Handler {
 	// Egress log read (dashboard). POST is system-level (see above), GET is
 	// tenant-scoped so dashboards never read across tenants.
 	scoped("GET", "/v1/egress", s.handleEgressList)
+
+	// /v1/me — every authenticated user reads their own identity (no capability
+	// gate). The dashboard polls this on load to branch on role/capabilities and
+	// to render the signed-in user's name in the header.
+	authedScoped("GET", "/v1/me", s.handleMe)
 
 	// Human auth: §7(a) GitHub OAuth device flow. Unauthenticated by design —
 	// they are the bootstrap path that produces the session token everything
