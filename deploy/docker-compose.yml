@@ -44,20 +44,24 @@ services:
   # The runner-host egress proxy (§11.2): default-deny allow-list. The per-run
   # orchestrator containers attach ONLY to flow-egress and route out through here.
   egress-proxy:
-    image: ubuntu/squid:latest
+    # Custom image: ubuntu/squid + iptables/ipset, with the §11.2 firewall and
+    # config baked in. The stock ubuntu/squid image lacks the firewall tooling
+    # and its entrypoint treats `command` as squid args, so it cannot run the
+    # allow-list itself — see deploy/Dockerfile.egress.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.egress
     restart: always
     cap_add:
-      - NET_ADMIN # required to install the iptables/ipset firewall
+      - NET_ADMIN # required to program the iptables/ipset firewall
     volumes:
-      - ./egress-proxy/init-firewall.sh:/init-firewall.sh:ro
-      - ./egress-proxy/squid.conf:/etc/squid/squid.conf:ro
       # Shared with flow-runner so the §11.6 shipper can tail access.log.
       - egress-log:/var/log/squid
     networks:
       - default
       - flow-egress
-    # init-firewall runs before squid; egress logging -> §11.6.
-    command: ["bash", "-c", "/init-firewall.sh && squid -N"]
+    # Firewall init + squid launch are baked into the image entrypoint
+    # (firewall runs before squid; egress logging -> §11.6).
 
   flow-runner:
     build:
