@@ -41,7 +41,7 @@ const (
 	StepProvisionEnv  Step = "S7c_provision_env" // opt-in test-env hook
 	StepImplementer   Step = "S8_implementer"    // implementer agent
 	StepEvolution     Step = "S9_evolution"      // evolution agent
-	StepPush          Step = "S10_push"          // push branch (scoped, via proxy)
+	StepPush          Step = "S10_push"          // push branch (trusted side, broker token)
 	StepPR            Step = "S11_pr"            // open PR
 	StepFinalize      Step = "S12_finalize"      // finalize run state
 )
