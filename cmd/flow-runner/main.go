@@ -32,6 +32,8 @@ import (
 	"github.com/Silon-Oy/flow/internal/lease"
 	"github.com/Silon-Oy/flow/internal/orchestrator"
 	"github.com/Silon-Oy/flow/internal/runnerexec"
+	"github.com/Silon-Oy/flow/internal/runnergit"
+	"github.com/Silon-Oy/flow/internal/runstate"
 	"github.com/Silon-Oy/flow/internal/worktree"
 )
 
@@ -178,7 +180,7 @@ func pullAndRun(ctx context.Context, cli *centralclient.Client, runnerID, repoRo
 	// trusted runner; the untrusted orchestrator container never gets it).
 	// FLOW_RUNNER_MODE=container selects the sandboxed path; default is inproc.
 	if mode == "container" {
-		return runInContainer(runCtx, cli, work, runID, branch, repoRoot, central, acq.Env)
+		return runInContainer(runCtx, cli, work, lz.ID, runID, branch, repoRoot, central, acq.Env)
 	}
 
 	// Fetch issue body + comments + image URLs on the trusted host BEFORE
@@ -201,26 +203,56 @@ func pullAndRun(ctx context.Context, cli *centralclient.Client, runnerID, repoRo
 		AutoMode:       true,
 	}
 	o := orchestrator.New(cfg, claude.New(), reporter)
-	gitOps := orchestrator.ShellGitOps{Remote: work.Remote}
+	// §11.3 model C (decision 19): push/PR authenticate with a broker-minted
+	// App token on this (trusted) side — never the host's ambient gh login.
+	// Every side effect re-verifies the lease (§10/R5).
+	gitOps := brokerGitOps(cli, work.Remote, lz.ID)
 
 	outcome, err := o.Run(runCtx, gitOps)
 	if err != nil {
 		log.Printf("flow-runner: run %s error: %v", runID, err)
 		return nil
 	}
+	recordPRURL(ctx, cli, runID, outcome.PRURL)
 	log.Printf("flow-runner: run %s finished: status=%s step=%s", runID, outcome.Status, outcome.LastStep)
 	return nil
 }
 
+// brokerGitOps builds the credentialed, lease-gated GitOps for a run's
+// GitHub writes (§11.3 model C).
+func brokerGitOps(cli *centralclient.Client, remote, leaseID string) *runnergit.GitOps {
+	return &runnergit.GitOps{
+		Remote: remote,
+		Minter: cli,
+		VerifyLease: func(ctx context.Context) error {
+			return cli.LeaseHeartbeat(ctx, leaseID)
+		},
+	}
+}
+
+// recordPRURL patches the opened PR's URL onto the run record (best-effort —
+// the dashboard link, not the source of truth).
+func recordPRURL(ctx context.Context, cli *centralclient.Client, runID, prURL string) {
+	if prURL == "" {
+		return
+	}
+	if err := cli.PatchRun(ctx, runID, map[string]any{"pr_url": prURL}); err != nil {
+		log.Printf("flow-runner: patch pr_url: %v", err)
+	}
+}
+
 // runInContainer creates the per-run worktree on the host and dispatches the
 // orchestration into a hardened ephemeral container (§11.1). The host never
-// runs the orchestrator itself in this path — that is the trust boundary.
+// runs the agent phase itself in this path — that is the trust boundary.
 //
-// Reporter/telemetry: the host does NOT report stage transitions here; the
-// in-container orchestrator reports them itself via centralclient (FLOW_CENTRAL_URL
-// + FLOW_RUNNER_TOKEN passed in env by runnerexec.Spec). On container exit we
-// log the result; the run's terminal status is whatever the container PATCHed.
-func runInContainer(ctx context.Context, cli *centralclient.Client, work *lease.Work, runID, branch, repoRoot, central string, leaseEnv map[string]string) error {
+// Reporter/telemetry: the host does NOT report stage transitions during the
+// agent phase; the in-container orchestrator reports them itself via
+// centralclient (FLOW_CENTRAL_URL + FLOW_RUNNER_TOKEN passed in env by
+// runnerexec.Spec). The container finalizes its own failures; on a clean
+// handoff (run still non-terminal) the host runs the S10–S12 GitHub tail with
+// a broker-minted App token (§11.3 model C, decision 19) — the token never
+// enters the container.
+func runInContainer(ctx context.Context, cli *centralclient.Client, work *lease.Work, leaseID, runID, branch, repoRoot, central string, leaseEnv map[string]string) error {
 	// S4 (host-side): fetch the remote and create the per-run worktree. The
 	// orchestrator inside the container will see this as /work and skip its own
 	// worktree.Create (Config.WorktreePath is non-empty).
@@ -272,20 +304,58 @@ func runInContainer(ctx context.Context, cli *centralclient.Client, work *lease.
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	containerErr := cmd.Run()
+	if containerErr != nil {
 		// Container exit ≠ 0 means the orchestrator inside either reported the
 		// failure (terminal status already PATCHed) or died abnormally. Log; do
 		// not retry — the lease release will let another runner pick this up.
-		log.Printf("flow-runner: run %s container exited: %v", runID, err)
+		log.Printf("flow-runner: run %s container exited: %v", runID, containerErr)
 	}
 	log.Printf("flow-runner: run %s container finished", runID)
+
+	// §11.3 model C: the GitHub write path (S10 push, S11 PR) runs HERE, on the
+	// trusted side, after the container exits. The container finalizes its own
+	// failures, so a run that is still non-terminal means the agent phase
+	// handed off cleanly and the worktree holds the committed work.
+	run, err := cli.GetRun(ctx, runID)
+	if err != nil {
+		log.Printf("flow-runner: run %s: fetch run after container: %v", runID, err)
+		return nil
+	}
+	if run.Status != runstate.StatusInitialized {
+		return nil // container reported a terminal status — nothing to push
+	}
+	if containerErr != nil {
+		// Died without finalizing (crash/OOM): do not push a half-finished
+		// worktree; the host owns this transition.
+		_ = cli.PatchRun(ctx, runID, map[string]any{
+			"status":         "blocked",
+			"blocked_reason": "container_exited_uncleanly: " + containerErr.Error(),
+			"finished":       true,
+		})
+		return nil
+	}
+
+	reporter := orchestrator.NewHTTPReporter(cli, runID)
+	outcome, err := orchestrator.FinishGitHub(ctx, reporter, brokerGitOps(cli, work.Remote, leaseID),
+		wt, branch, "", work.IssueNumber)
+	if err != nil {
+		log.Printf("flow-runner: run %s finish error: %v", runID, err)
+		return nil
+	}
+	recordPRURL(ctx, cli, runID, outcome.PRURL)
+	log.Printf("flow-runner: run %s finished: status=%s step=%s pr=%s",
+		runID, outcome.Status, outcome.LastStep, outcome.PRURL)
 	return nil
 }
 
-// runOrchestrate is the in-container entrypoint (§11.1). It runs the S1–S12
-// machine against /work (the only host mount) and reports telemetry back to the
-// central service via centralclient — the run's host context (the runner's
-// clone, the GitHub credential) is deliberately NOT available here.
+// runOrchestrate is the in-container entrypoint (§11.1). It runs the agent
+// phase of the S1–S12 machine against /work (the only host mount) and reports
+// telemetry back to the central service via centralclient — the run's host
+// context (the runner's clone, the GitHub credential) is deliberately NOT
+// available here. Per §11.3 model C the machine hands off after S9: the
+// trusted runner host performs push/PR with the broker token once this
+// process exits.
 func runOrchestrate(runID string) error {
 	central := os.Getenv("FLOW_CENTRAL_URL")
 	if central == "" {
@@ -327,13 +397,29 @@ func runOrchestrate(runID string) error {
 		// GitHub token); the container path will receive them via the run record in
 		// a later pass. Left empty here so the sandbox never needs a token.
 		AutoMode: true,
+		// §11.3 model C: stop after S9 — push/PR happen on the runner host with
+		// the broker token after this container exits. This process never holds
+		// a GitHub credential (invariant 3).
+		HandoffAfterAgent: true,
 	}
 	o := orchestrator.New(cfg, claude.New(), reporter)
+	// ShellGitOps serves only the S7b dependency install here; Push/OpenPR are
+	// unreachable behind HandoffAfterAgent.
 	gitOps := orchestrator.ShellGitOps{Remote: run.Remote}
 
 	outcome, err := o.Run(ctx, gitOps)
 	if err != nil {
 		return fmt.Errorf("orchestrator: %w", err)
+	}
+	// Handoff leaves the run non-terminal, so Finalize (which flushes) may not
+	// have run — flush buffered telemetry before the container exits.
+	if err := reporter.Flush(ctx); err != nil {
+		log.Printf("flow-orchestrator: flush telemetry: %v", err)
+	}
+	if outcome.Status == "" {
+		log.Printf("flow-orchestrator: run %s agent phase done (step=%s) — handing off push/PR to the runner host",
+			runID, outcome.LastStep)
+		return nil
 	}
 	log.Printf("flow-orchestrator: run %s finished: status=%s step=%s",
 		runID, outcome.Status, outcome.LastStep)

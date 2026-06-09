@@ -93,9 +93,11 @@ func (s Spec) DockerArgs() []string {
 		fmt.Sprintf("--pids-limit=%d", pids),
 		// The ONLY host mount: the per-run worktree.
 		"-v", s.WorktreePath + ":/work",
-		// Egress goes through the proxy; the GitHub token is injected proxy-side
-		// (§11.3), so HTTPS_PROXY is the only network env the container sees for
-		// the GitHub path.
+		// Egress goes through the proxy (allow-list + log). The container never
+		// carries a GitHub credential: the GitHub write path (push/PR) runs on
+		// the trusted runner host after the container exits (§11.3 model C,
+		// decision 19), so HTTPS_PROXY is the only network env the container
+		// sees for the GitHub path.
 		"-e", "HTTPS_PROXY=" + proxy,
 		"-e", "HTTP_PROXY=" + proxy,
 	}

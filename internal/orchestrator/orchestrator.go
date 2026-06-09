@@ -41,7 +41,7 @@ const (
 	StepProvisionEnv  Step = "S7c_provision_env" // opt-in test-env hook
 	StepImplementer   Step = "S8_implementer"    // implementer agent
 	StepEvolution     Step = "S9_evolution"      // evolution agent
-	StepPush          Step = "S10_push"          // push branch (scoped, via proxy)
+	StepPush          Step = "S10_push"          // push branch (trusted side, broker token)
 	StepPR            Step = "S11_pr"            // open PR
 	StepFinalize      Step = "S12_finalize"      // finalize run state
 )
@@ -100,6 +100,16 @@ type Config struct {
 
 	// AutoMode skips the interactive review gate (RUN_ISSUES_AUTO=1 equivalent).
 	AutoMode bool
+
+	// HandoffAfterAgent stops the machine after S9 (evolution) WITHOUT running
+	// push/PR or finalizing the run (§11.3 model C, decision 19). This is the
+	// container-mode flag: the in-container orchestrator never holds a GitHub
+	// credential, so it commits to the mounted worktree and exits; the trusted
+	// runner host then runs the S10–S12 tail via FinishGitHub with a
+	// broker-minted App token. The run record stays non-terminal (initialized)
+	// so the host phase knows the agent phase handed off cleanly — failures
+	// before S10 are still finalized in-container as before.
+	HandoffAfterAgent bool
 }
 
 // Orchestrator drives one run.
@@ -125,9 +135,9 @@ type Outcome struct {
 
 // Run executes the S1–S12 machine. It pushes state transitions and decision
 // events through the Reporter and returns the terminal Outcome. The side-effect
-// steps that need GitHub (S10 push, S11 PR) are wired through gh-shell-out by
-// the runner via the GitOps hook; here they are sequenced and gated on the
-// lease being held.
+// steps that need GitHub (S10 push, S11 PR) run via the GitOps hook on the
+// trusted side (§11.3 model C) — sequenced here, gated on the lease being held,
+// and skipped entirely when HandoffAfterAgent defers them to the runner host.
 func (o *Orchestrator) Run(ctx context.Context, git GitOps) (Outcome, error) {
 	out := Outcome{Branch: o.cfg.Branch, LastStep: StepLeaseHeld}
 
@@ -223,28 +233,50 @@ func (o *Orchestrator) Run(ctx context.Context, git GitOps) (Outcome, error) {
 	}
 	out.LastStep = StepEvolution
 
-	// S10: push (scoped git-write through the egress proxy; the proxy injects
-	// the credential — the container never holds the token, §11.3).
-	o.setState(ctx, StepPush)
-	if err := git.Push(ctx, wt, o.cfg.Branch); err != nil {
-		return o.fail(ctx, out, StepPush, "blocked", "push_failed: "+err.Error())
+	if o.cfg.HandoffAfterAgent {
+		// §11.3 model C (decision 19): the GitHub write path (S10 push, S11 PR)
+		// runs on the trusted runner host after this container exits — the token
+		// never crosses into this process. Leave the run non-terminal; the host
+		// owns S10–S12 via FinishGitHub.
+		o.event(ctx, "agent_phase_done", nil)
+		return out, nil
+	}
+
+	return FinishGitHub(ctx, o.report, git, wt, o.cfg.Branch, o.cfg.BaseBranch, o.cfg.IssueNumber)
+}
+
+// FinishGitHub runs the trusted-side tail of the S1–S12 machine: S10 push,
+// S11 PR, S12 finalize (§11.3 model C, decision 19). In container mode the
+// runner host calls this after the agent container has handed off
+// (Config.HandoffAfterAgent); in in-process mode Run calls it directly. Push
+// and PR are side-effecting GitHub writes, so the GitOps passed here must be
+// the credentialed, lease-gated one (runnergit.GitOps with VerifyLease set —
+// §10/R5 split-brain guard).
+func FinishGitHub(ctx context.Context, report Reporter, git GitOps, wt, branch, baseBranch string, issueNumber int) (Outcome, error) {
+	out := Outcome{Branch: branch, LastStep: StepEvolution}
+
+	// S10: push the auto-run branch. Scope enforcement is the App-token
+	// permission + branch protection (§11.4 / decision 12), not the proxy.
+	_ = report.SetState(ctx, StepPush)
+	if err := git.Push(ctx, wt, branch); err != nil {
+		return failOutcome(ctx, report, out, StepPush, "blocked", "push_failed: "+err.Error())
 	}
 	out.LastStep = StepPush
 
 	// S11: open PR.
-	o.setState(ctx, StepPR)
-	prURL, err := git.OpenPR(ctx, wt, o.cfg.Branch, o.cfg.BaseBranch, o.cfg.IssueNumber)
+	_ = report.SetState(ctx, StepPR)
+	prURL, err := git.OpenPR(ctx, wt, branch, baseBranch, issueNumber)
 	if err != nil {
-		return o.fail(ctx, out, StepPR, "blocked", "pr_open_failed: "+err.Error())
+		return failOutcome(ctx, report, out, StepPR, "blocked", "pr_open_failed: "+err.Error())
 	}
 	out.PRURL = prURL
 	out.LastStep = StepPR
 
 	// S12: finalize.
-	o.setState(ctx, StepFinalize)
+	_ = report.SetState(ctx, StepFinalize)
 	out.Status = "completed"
 	out.LastStep = StepFinalize
-	_ = o.report.Finalize(ctx, "completed", "")
+	_ = report.Finalize(ctx, "completed", "")
 	return out, nil
 }
 
@@ -280,10 +312,14 @@ func (o *Orchestrator) event(ctx context.Context, event string, data map[string]
 }
 
 func (o *Orchestrator) fail(ctx context.Context, out Outcome, step Step, status, reason string) (Outcome, error) {
+	return failOutcome(ctx, o.report, out, step, status, reason)
+}
+
+func failOutcome(ctx context.Context, report Reporter, out Outcome, step Step, status, reason string) (Outcome, error) {
 	out.LastStep = step
 	out.Status = status
 	out.Reason = reason
-	_ = o.report.Finalize(ctx, status, reason)
+	_ = report.Finalize(ctx, status, reason)
 	return out, nil
 }
 
