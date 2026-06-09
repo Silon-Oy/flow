@@ -47,6 +47,7 @@ func (f *fakeReporter) Finalize(_ context.Context, status, reason string) error 
 type fakeGitOps struct {
 	installs []string
 	pushed   bool
+	pushErr  error
 	prURL    string
 }
 
@@ -54,7 +55,13 @@ func (g *fakeGitOps) Install(_ context.Context, _ string, m string) error {
 	g.installs = append(g.installs, m)
 	return nil
 }
-func (g *fakeGitOps) Push(_ context.Context, _, _ string) error { g.pushed = true; return nil }
+func (g *fakeGitOps) Push(_ context.Context, _, _ string) error {
+	if g.pushErr != nil {
+		return g.pushErr
+	}
+	g.pushed = true
+	return nil
+}
 func (g *fakeGitOps) OpenPR(_ context.Context, _, _, _ string, _ int) (string, error) {
 	g.prURL = "https://github.com/o/r/pull/1"
 	return g.prURL, nil
@@ -132,6 +139,94 @@ func TestOrchestratorHappyPath(t *testing.T) {
 	// The full blueprint advanced through finalize.
 	if out.LastStep != StepFinalize {
 		t.Errorf("last step = %s, want finalize", out.LastStep)
+	}
+}
+
+// TestOrchestratorHandoffAfterAgent asserts the §11.3 model C container phase:
+// the machine stops after S9 without pushing, opening a PR or finalizing — the
+// trusted runner host owns the S10–S12 tail.
+func TestOrchestratorHandoffAfterAgent(t *testing.T) {
+	repo := makeRepo(t)
+	rep := &fakeReporter{}
+	git := &fakeGitOps{}
+	c := mockClaude("echo CYCLE_REVIEW_DECISION: PROCEED; echo IMPLEMENTER_RESULT: SUCCESS")
+
+	o := New(Config{
+		RunID: "rid-handoff", RepoRoot: repo, Remote: "origin",
+		Branch: "auto-run/issue-4", IssueNumber: 4, AutoMode: true,
+		HandoffAfterAgent: true,
+	}, c, rep)
+
+	out, err := o.Run(context.Background(), git)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if git.pushed {
+		t.Errorf("container phase must NOT push (§11.3 model C)")
+	}
+	if out.PRURL != "" {
+		t.Errorf("container phase must NOT open a PR")
+	}
+	if out.LastStep != StepEvolution {
+		t.Errorf("last step = %s, want %s", out.LastStep, StepEvolution)
+	}
+	if out.Status != "" {
+		t.Errorf("status = %q, want non-terminal (empty)", out.Status)
+	}
+	if rep.finalSt != "" {
+		t.Errorf("must not finalize on handoff; finalized as %q", rep.finalSt)
+	}
+}
+
+// TestFinishGitHub asserts the trusted-side tail: S10 push → S11 PR → S12
+// finalize, reported through the Reporter.
+func TestFinishGitHub(t *testing.T) {
+	rep := &fakeReporter{}
+	git := &fakeGitOps{}
+
+	out, err := FinishGitHub(context.Background(), rep, git, "/tmp/wt", "auto-run/issue-5", "", 5)
+	if err != nil {
+		t.Fatalf("FinishGitHub: %v", err)
+	}
+	if !git.pushed {
+		t.Errorf("expected push")
+	}
+	if out.Status != "completed" || out.LastStep != StepFinalize {
+		t.Errorf("status=%q step=%s, want completed/finalize", out.Status, out.LastStep)
+	}
+	if out.PRURL == "" {
+		t.Errorf("expected PR url")
+	}
+	if rep.finalSt != "completed" {
+		t.Errorf("reporter final = %q, want completed", rep.finalSt)
+	}
+	wantStates := []Step{StepPush, StepPR, StepFinalize}
+	if len(rep.states) != len(wantStates) {
+		t.Fatalf("states = %v, want %v", rep.states, wantStates)
+	}
+	for i, s := range wantStates {
+		if rep.states[i] != s {
+			t.Errorf("state[%d] = %s, want %s", i, rep.states[i], s)
+		}
+	}
+}
+
+func TestFinishGitHubPushFailureBlocks(t *testing.T) {
+	rep := &fakeReporter{}
+	git := &fakeGitOps{pushErr: context.DeadlineExceeded}
+
+	out, err := FinishGitHub(context.Background(), rep, git, "/tmp/wt", "auto-run/issue-6", "", 6)
+	if err != nil {
+		t.Fatalf("FinishGitHub: %v", err)
+	}
+	if out.Status != "blocked" || out.LastStep != StepPush {
+		t.Errorf("status=%q step=%s, want blocked/push", out.Status, out.LastStep)
+	}
+	if out.PRURL != "" {
+		t.Errorf("must not open a PR after a failed push")
+	}
+	if rep.finalSt != "blocked" {
+		t.Errorf("reporter final = %q, want blocked", rep.finalSt)
 	}
 }
 
