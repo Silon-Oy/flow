@@ -63,6 +63,9 @@ type GitOps struct {
 	// env appended to the parent environment.
 	runCmd func(ctx context.Context, dir string, extraEnv []string, name string, args ...string) (string, error)
 
+	// tok caches the minted token without an org key: safe only because one
+	// GitOps instance serves exactly one run and hence one Remote/org. Do not
+	// share an instance across runs — a stale cross-org token would be reused.
 	mu  sync.Mutex
 	tok *centralclient.GitHubAppToken
 }
