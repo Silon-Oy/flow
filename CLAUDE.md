@@ -15,43 +15,49 @@ pätevät normaalisti — älä toista niitä tässä.
 
 ## Status & roadmap
 
-Vaihe 0 + 1 (MVP-runko) on toteutettu. `internal/{auth,githubapp,secrets}` ovat
-tyhjiä seamejä Vaiheille 2–3. Kehitystyö on jäsennetty GitHub-milestoneilla
+Vaiheet 0–3 on pääosin toteutettu — `internal/{auth,githubapp,secrets}` eivät
+ole enää tyhjiä seamejä, vaan sisältävät toimivan toteutuksen (mm.
+`internal/githubapp/broker.go`, `internal/api/github_app_handlers.go`,
+`internal/centralclient`). Kehitystyö on jäsennetty GitHub-milestoneilla
 suunnitelman §15-vaiheistuksen mukaan (avoimet työt:
 [issue-lista](https://github.com/Silon-Oy/flow/issues)). README pidetään
 puhtaana käyttöönotto-/käyttöoppaana — roadmap asuu **tässä**.
 
 - **Vaihe 0** — diagnostinen pohja: PORT-funktiot Goon testeineen, Postgres-
   skeema, `flowd` käynnistyy tyhjänä. **Valmis.**
-- **Vaihe 1 — MVP** (runko valmis): keskitetty lease (§5, `internal/lease`),
+- **Vaihe 1 — MVP** — **valmis**: keskitetty lease (§5, `internal/lease`),
   Run/RunEvent-API + SSE (`internal/api`), GitHub-skanneri (`internal/ghclient`),
   `flow-runner` pull-loop + S1–S12-orkestraattori (`internal/orchestrator`),
+  kontti-dispatch ([#1](https://github.com/Silon-Oy/flow/issues/1)),
+  ghclient issue-fetch ([#2](https://github.com/Silon-Oy/flow/issues/2)),
   kovennetun kontin `docker run`-flagit (`internal/runnerexec`, §11.1),
-  egress-proxy (`deploy/egress-proxy`, §11.2/6), `flowctl status`, read-only
-  dashboard. Single-tenant datassa, `tenant_id` skeemassa valmiina.
-  Viimeistelyn langanpäät → [milestone 1](https://github.com/Silon-Oy/flow/milestone/1):
-  kontti-dispatch [#1](https://github.com/Silon-Oy/flow/issues/1),
-  ghclient issue-fetch [#2](https://github.com/Silon-Oy/flow/issues/2),
-  egress-loki [#3](https://github.com/Silon-Oy/flow/issues/3).
-- **Vaihe 2 — Multi-tenancy + RBAC + auth** →
-  [milestone 2](https://github.com/Silon-Oy/flow/milestone/2): tenant-middleware
-  [#4](https://github.com/Silon-Oy/flow/issues/4), OAuth device flow
-  [#5](https://github.com/Silon-Oy/flow/issues/5), runner-token
+  egress-proxy + egress-loki (`deploy/egress-proxy`, §11.2/6,
+  [#3](https://github.com/Silon-Oy/flow/issues/3)), `flowctl status`,
+  read-only dashboard.
+- **Vaihe 2 — Multi-tenancy + RBAC + auth** — **toteutettu**
+  ([milestone 2](https://github.com/Silon-Oy/flow/milestone/2)):
+  tenant-middleware [#4](https://github.com/Silon-Oy/flow/issues/4), OAuth
+  device flow [#5](https://github.com/Silon-Oy/flow/issues/5), runner-token
   [#6](https://github.com/Silon-Oy/flow/issues/6), roolit
   [#7](https://github.com/Silon-Oy/flow/issues/7), App-broker
-  [#8](https://github.com/Silon-Oy/flow/issues/8), audit-loki
+  [#8](https://github.com/Silon-Oy/flow/issues/8). Avoinna: audit-loki
   [#21](https://github.com/Silon-Oy/flow/issues/21).
-- **Vaihe 3 — Wizard + secrets-broker** →
-  [milestone 3](https://github.com/Silon-Oy/flow/milestone/3): `flowctl init`
+- **Vaihe 3 — Wizard + secrets-broker** — **toteutettu**
+  ([milestone 3](https://github.com/Silon-Oy/flow/milestone/3)): `flowctl init`
   [#9](https://github.com/Silon-Oy/flow/issues/9), secrets-broker
   [#10](https://github.com/Silon-Oy/flow/issues/10), admin-dashboard
   [#11](https://github.com/Silon-Oy/flow/issues/11).
-- **Vaihe 4 — PR-watch + viimeistely + Taso 2** →
-  [milestone 4](https://github.com/Silon-Oy/flow/milestone/4): `internal/prwatch`
-  [#12](https://github.com/Silon-Oy/flow/issues/12), deploy + Tailscale
-  [#13](https://github.com/Silon-Oy/flow/issues/13), gVisor opt-in
-  [#14](https://github.com/Silon-Oy/flow/issues/14), Prometheus /metrics
-  [#22](https://github.com/Silon-Oy/flow/issues/22).
+- **Vaihe 4 — PR-watch + viimeistely + Taso 2** — avoinna
+  ([milestone 4](https://github.com/Silon-Oy/flow/milestone/4)):
+  `internal/prwatch` [#12](https://github.com/Silon-Oy/flow/issues/12),
+  deploy + Tailscale [#13](https://github.com/Silon-Oy/flow/issues/13),
+  gVisor opt-in [#14](https://github.com/Silon-Oy/flow/issues/14),
+  Prometheus /metrics [#22](https://github.com/Silon-Oy/flow/issues/22).
+
+**MVP-viimeistelyn este:** push/PR-autentikointi
+[#34](https://github.com/Silon-Oy/flow/issues/34) — päästä-päähän-ajo katkeaa
+tällä hetkellä push-vaiheeseen, koska viimeisen mailin GitHub-credentiaali
+puuttuu (token broker → runner → push).
 
 Suunnitelman §17 avoimet päätökset (10–14) on ratkaistu ja kirjattu
 päätöslokiin §2.2 ([#15](https://github.com/Silon-Oy/flow/issues/15) suljettu).
