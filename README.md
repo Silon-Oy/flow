@@ -136,13 +136,15 @@ cd flow
 
 ### 2. Luo asetustiedosto
 
-Asetukset annetaan `.env`-tiedostolla. Kopioi malli ja täytä arvot:
+Asetukset annetaan `.env`-tiedostolla, jonka Docker Compose lukee
+`deploy/`-kansiosta (compose ajetaan siellä, ks. kohta 5). Kopioi malli ja
+täytä arvot:
 
 ```sh
-cp .env.example .env
+cp .env.example deploy/.env
 ```
 
-Avaa `.env` ja aseta vähintään nämä:
+Avaa `deploy/.env` ja aseta vähintään nämä:
 
 | Asetus | Mitä se on | Pakollinen |
 |---|---|---|
@@ -155,14 +157,14 @@ Avaa `.env` ja aseta vähintään nämä:
 Loput asetukset ovat järkevillä oletuksilla. Tärkeimmät selitykset ovat
 `.env.example`-tiedostossa kommentteina.
 
-> **Tärkeää:** älä koskaan vie täytettyä `.env`-tiedostoa versionhallintaan.
+> **Tärkeää:** älä koskaan vie täytettyä `deploy/.env`-tiedostoa versionhallintaan.
 > Salaisuudet annetaan vain tässä — ne eivät kuulu koodiin eivätkä lokeihin.
 
 ### 3. Valmistele GitHub
 
 **(a) Tehtävien tarkkailu (vapaaehtoinen mutta suositeltu).**
 Luo lukuoikeudellinen pääsytunnus, jolla keskus näkee repositorion tehtävät, ja
-laita se `.env`-tiedoston `FLOW_GITHUB_TOKEN`-arvoksi. Ilman tunnusta keskus
+laita se `deploy/.env`-tiedoston `FLOW_GITHUB_TOKEN`-arvoksi. Ilman tunnusta keskus
 pollaa GitHubia anonyymisti ja törmää nopeasti kyselyrajoituksiin.
 
 **(b) Kehittäjien kirjautuminen (jos haluat `flowctl login`-toiminnon).**
@@ -175,7 +177,7 @@ SSH-yhteyden yli, koska mitään selainta ei tarvita itse palvelimella.
    keskuspalvelun osoite. (Laitevaltuutuksessa callback-osoitteella ei ole
    merkitystä, mutta lomake vaatii sen.)
 3. Laitevaltuutus tarvitsee vain **client ID**:n — *client secret*-arvoa **ei**
-   tarvita. Kopioi client ID ja aseta se `.env`-tiedoston
+   tarvita. Kopioi client ID ja aseta se `deploy/.env`-tiedoston
    `FLOW_GITHUB_OAUTH_CLIENT_ID`-arvoksi.
 
 Jos jätät tämän tyhjäksi, `flowctl login` ei ole käytössä (keskus palauttaa
@@ -471,7 +473,7 @@ docs/                              arkkitehtuuri ja kaaviot
 | Tehtävä ei lähde käyntiin merkinnän lisäämisen jälkeen | Onko `auto-run`-merkintä juuri kyseinen, jonka projekti odottaa? Onko keskuksella lukuoikeus (`FLOW_GITHUB_TOKEN`)? Tarkistus tehdään tarkkailuvälein (oletus 60 s). |
 | Ajo jää tilaan `awaiting_clarification` | Agentti tarvitsee lisätietoa. Vastaa tehtävän kommenttiin esitettyyn kysymykseen. |
 | `flow-runner: FLOW_RUNNER_MODE=container but docker not in PATH` | Kontti-tila vaatii Dockerin. Kehityskoneella käytä `FLOW_RUNNER_MODE=inproc` tai asenna Docker. |
-| Keskuksen lokit valittavat tietokantayhteydestä | Onko `POSTGRES_PASSWORD` asetettu `.env`:iin? Onko `postgres`-palvelu terve (`docker compose ps`)? |
+| Keskuksen lokit valittavat tietokantayhteydestä | Onko `POSTGRES_PASSWORD` asetettu `deploy/.env`:iin? Onko `postgres`-palvelu terve (`docker compose ps`)? |
 
 Tarkkojen asetusten merkitykset löytyvät `.env.example`-tiedoston kommenteista, ja
 arkkitehtuurin yksityiskohdat dokumentista
