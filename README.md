@@ -197,8 +197,23 @@ docker build -f deploy/Dockerfile.orchestrator -t flow-orchestrator:latest .
 ```
 
 Tämä image sisältää koodausagentin (claude-code) ja Flow'n suorituslogiikan. Se
-ei sisällä mitään pääsytunnuksia — ne tuodaan vasta ajon aikana eristyksen
-sisälle (ks. [Turvallisuusmalli](#turvallisuusmalli-lyhyesti)).
+ei sisällä mitään projektin koodia eikä pääsytunnuksia — projektin lähdekoodi
+liitetään konttiin vasta ajon aikana (oma per-ajo-työhakemisto), ja tunnukset
+tuodaan eristyksen sisälle vasta silloin (ks.
+[Turvallisuusmalli](#turvallisuusmalli-lyhyesti)).
+
+**Tämä on kone-, ei projektikohtainen vaihe.** Image on geneerinen ajoympäristö,
+joka kelpaa kaikille projekteille ja kaikille ajoille:
+
+- **Rakenna kerran jokaisella suorituskoneella** (kone, jolla `flow-runner` ajaa
+  kontti-tilassa). Pelkkä keskus (`flowd`) tai kehittäjän `flowctl`-kone **ei**
+  tarvitse imagea. Jos suorituskoneita on monta, jokaisella pitää olla image
+  rakennettuna (tai jaettuna konttirekisterin kautta).
+- **Uusi projekti ei vaadi uutta buildia** — riittää `flowctl init` (ks.
+  [Projektin rekisteröinti](#projektin-rekisteröinti)).
+- **Rakenna image uudelleen vain, kun Flow itse päivittyy**: muuttuvat agentin
+  kehotteet (`internal/prompts/files/`), orkestraattorin koodi tai claude-code-
+  versio. Käytännössä `git pull` → sama `docker build` uudelleen.
 
 > Jos haluat ajaa työt **ilman erillistä konttia** (esim. kehityskoneella, jossa
 > ei ole Dockeria käytettävissä), voit jättää tämän väliin ja käyttää
