@@ -36,8 +36,22 @@ services:
       FLOWD_ADDR: ":8080"
       FLOW_DATABASE_URL: "postgres://flow:${POSTGRES_PASSWORD:?}@postgres:5432/flow?sslmode=disable"
       FLOW_BOOTSTRAP_TENANT: ${FLOW_BOOTSTRAP_TENANT:-default}
+      # §7: promote this GitHub login to admin in the bootstrap tenant at startup.
+      FLOW_BOOTSTRAP_ADMIN: ${FLOW_BOOTSTRAP_ADMIN:-}
       FLOW_GITHUB_TOKEN: ${FLOW_GITHUB_TOKEN:-}
       FLOW_SCAN_INTERVAL: ${FLOW_SCAN_INTERVAL:-60s}
+      # §7(a) device flow for `flowctl login`. Empty => /v1/auth/device/* returns 503.
+      FLOW_GITHUB_OAUTH_CLIENT_ID: ${FLOW_GITHUB_OAUTH_CLIENT_ID:-}
+      # §7.3 GitHub App token broker (push/PR auth, #34 model C). Empty broker
+      # token => GET /v1/github-app/token returns 503 (fail-closed). The four
+      # APP_* vars env-bootstrap one (tenant, org) -> installation row at startup;
+      # PRIVATE_KEY_REF names the env var holding the PEM (resolved at mint time).
+      FLOW_BROKER_TOKEN: ${FLOW_BROKER_TOKEN:-}
+      FLOW_GITHUB_APP_ORG: ${FLOW_GITHUB_APP_ORG:-}
+      FLOW_GITHUB_APP_ID: ${FLOW_GITHUB_APP_ID:-}
+      FLOW_GITHUB_APP_INSTALLATION_ID: ${FLOW_GITHUB_APP_INSTALLATION_ID:-}
+      FLOW_GITHUB_APP_PRIVATE_KEY_REF: ${FLOW_GITHUB_APP_PRIVATE_KEY_REF:-}
+      FLOW_GITHUB_APP_KEY_DEFAULT: ${FLOW_GITHUB_APP_KEY_DEFAULT:-}
     ports:
       - "8080:8080"
 
