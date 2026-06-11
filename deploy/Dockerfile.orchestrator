@@ -20,9 +20,32 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /out/flow-orchestrator ./cmd/flow-runne
 
 FROM node:22-slim
 
+# Base tooling + PHP/WordPress lint toolchain (#40). WordPress/PHP projects need
+# `composer install` (S5 env-bootstrap) and linting (php -l, PHPCS + WPCS) to run
+# inside the hardened container. The toolchain is baked into the image so it
+# needs NO runtime network (egress allow-list unchanged) and NO writable HOME.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends \
+      git ca-certificates unzip \
+      php-cli php-xml php-mbstring php-curl php-zip \
+      composer \
  && rm -rf /var/lib/apt/lists/*
+
+# PHP_CodeSniffer + WordPress Coding Standards baked into a fixed, world-readable
+# path. COMPOSER_HOME is scoped to these RUN steps only (not an ENV) so the
+# runtime `composer install` defaults back to $HOME/.composer (the writable tmpfs
+# HOME), never the read-only /opt path. WPCS pulls in the phpcodesniffer-composer
+# -installer plugin (registers the standard into phpcs's installed_paths); it
+# must be allow-listed before install. The plugin wires installed_paths into the
+# phpcs package dir, so `phpcs --standard=WordPress` resolves with no network and
+# runs fine as the §11.1 uid 65532 (--read-only, --cap-drop=ALL).
+RUN COMPOSER_HOME=/opt/composer composer global config --no-plugins allow-plugins.dealerdirect/phpcodesniffer-composer-installer true \
+ && COMPOSER_HOME=/opt/composer composer global require --no-interaction --no-progress \
+      squizlabs/php_codesniffer \
+      wp-coding-standards/wpcs \
+ && ln -s /opt/composer/vendor/bin/phpcs /usr/local/bin/phpcs \
+ && ln -s /opt/composer/vendor/bin/phpcbf /usr/local/bin/phpcbf \
+ && chmod -R a+rX /opt/composer
 
 RUN npm install -g @anthropic-ai/claude-code
 
