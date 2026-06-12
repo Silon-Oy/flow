@@ -137,8 +137,8 @@ cd flow
 ### 2. Luo asetustiedosto
 
 Asetukset annetaan `.env`-tiedostolla, jonka Docker Compose lukee
-`deploy/`-kansiosta (compose ajetaan siellä, ks. kohta 5). Kopioi malli ja
-täytä arvot:
+`deploy/`-kansiosta (compose ajetaan siellä, ks. kohta 6) — **ei** repon
+juuresta. Kopioi malli ja täytä arvot:
 
 ```sh
 cp .env.example deploy/.env
@@ -149,10 +149,23 @@ Avaa `deploy/.env` ja aseta vähintään nämä:
 | Asetus | Mitä se on | Pakollinen |
 |---|---|---|
 | `POSTGRES_PASSWORD` | Tietokannan salasana. Valitse pitkä satunnainen merkkijono. | **Kyllä** |
+| `FLOW_WORK_DIR` | Suorituskoneen työhakemiston **host-absoluuttinen** polku (`deploy/work`). Compose ei käynnisty ilman tätä. Ks. kohta 5. | **Kyllä** |
 | `FLOW_BOOTSTRAP_TENANT` | Asiakasorganisaation nimi. Yhden tiimin asennuksessa jätä arvoon `default`. | Ei (oletus `default`) |
 | `FLOW_BOOTSTRAP_ADMIN` | GitHub-käyttäjänimesi. Tämä käyttäjä saa ylläpitäjäoikeudet käynnistyksessä. | Suositus |
-| `FLOW_GITHUB_TOKEN` | Lukuoikeudellinen GitHub-pääsytunnus tehtävien tarkkailuun. | Ei (tyhjä = anonyymi) |
-| `FLOW_GITHUB_OAUTH_CLIENT_ID` | GitHub OAuth -sovelluksen tunniste `flowctl login`-kirjautumista varten (ks. kohta 3). | Tarvitaan kirjautumiseen |
+| `FLOW_GITHUB_TOKEN` | Lukuoikeudellinen GitHub-pääsytunnus tehtävien tarkkailuun ja tehtävän sisällön hakuun ennen ajoa. | Ei (tyhjä = anonyymi; yksityiset repot vaativat) |
+| `FLOW_GITHUB_OAUTH_CLIENT_ID` | GitHub OAuth -sovelluksen tunniste `flowctl login`-kirjautumista varten (ks. kohta 3(b)). | Tarvitaan kirjautumiseen |
+
+**Kontti-tila on compose-pinon oletus** (`FLOW_RUNNER_MODE=container`): jokainen
+ajo suoritetaan kovennetussa kertakäyttökontissa, ja agentin tekemä muutos
+työnnetään GitHubiin keskuksen välittämällä lyhytikäisellä tunnuksella. Tällöin
+edellisten lisäksi tarvitaan:
+
+| Asetus | Mitä se on |
+|---|---|
+| `FLOW_CLAUDE_CRED_PATH` | Claude-tunnistetiedoston polku isäntäkoneella. Liitetään ajon kontteihin vain luku -tilassa; ei koskaan ympäristömuuttujana eikä keskukselle. |
+| `FLOW_BROKER_TOKEN` | Pitkä satunnainen merkkijono. Suojaa keskuksen tunnusvälityspisteen (GitHub App token broker), josta suorituskone hakee push-tunnukset. |
+| `FLOW_RUNNER_TOKEN` | **Sama arvo kuin `FLOW_BROKER_TOKEN`.** Suorituskone esittää tämän keskukselle pyytäessään push-tunnusta. |
+| `FLOW_GITHUB_APP_ORG`, `FLOW_GITHUB_APP_ID`, `FLOW_GITHUB_APP_INSTALLATION_ID`, `FLOW_GITHUB_APP_PRIVATE_KEY_REF` | GitHub App -asennuksen tiedot push/PR-oikeuksia varten. Ks. kohta 3(d). |
 
 Loput asetukset ovat järkevillä oletuksilla. Tärkeimmät selitykset ovat
 `.env.example`-tiedostossa kommentteina.
@@ -188,6 +201,37 @@ Aseta repositorion päähaaralle suojaus: vaadi muutokset PR:n kautta ja estä
 suorat työnnöt ja suojattujen haarojen poisto. Flow luottaa siihen, että agentin
 tekemät muutokset käyvät PR-tarkastuksen läpi.
 
+**(d) GitHub App + tunnusvälitys (pakollinen kontti-tilassa).**
+Agentin koodimuutos työnnetään GitHubiin ja PR avataan GitHub App
+-asennustunnuksella, jonka keskus välittää suorituskoneelle lyhytikäisenä
+(token broker). Raaka tunnus ei koskaan päädy ajon konttiin.
+
+> **Tee tämä ennen projektin rekisteröintiä.** `flowctl init` tarkistaa, että
+> organisaatiolle on GitHub App -asennus, ja palauttaa muuten virheen
+> `412: no github app installation for org`.
+
+1. Luo GitHub App: <https://github.com/settings/apps> → **New GitHub App**
+   (organisaatiolle: *Your organizations* → *Settings* → *Developer settings*).
+   Oikeudet (Repository permissions): **Contents: Read and write** ja
+   **Pull requests: Read and write**. Webhookia ei tarvita.
+2. Asenna App organisaatioon (tai repositorioihin), joiden tehtäviä Flow ajaa.
+   Kirjaa ylös **App ID** ja asennuksen **Installation ID** (näkyy asennuksen
+   osoitteessa `.../installations/<id>`).
+3. Luo Appille **private key** (PEM-tiedosto) Appin asetussivulta.
+4. Täytä `deploy/.env`:
+   - `FLOW_GITHUB_APP_ORG` — organisaation nimi
+   - `FLOW_GITHUB_APP_ID` — App ID
+   - `FLOW_GITHUB_APP_INSTALLATION_ID` — Installation ID
+   - `FLOW_GITHUB_APP_PRIVATE_KEY_REF` — sen ympäristömuuttujan **nimi**, jossa
+     PEM-avain on (esim. `FLOW_GITHUB_APP_KEY_DEFAULT`) — viittaus, ei itse avain
+   - PEM-avaimen sisältö viittauksen osoittamaan muuttujaan (monirivinen PEM
+     yhdelle riville `\n`-merkeillä, tai Docker-secretinä)
+   - `FLOW_BROKER_TOKEN` — pitkä satunnainen merkkijono
+   - `FLOW_RUNNER_TOKEN` — **sama arvo** kuin `FLOW_BROKER_TOKEN`
+
+Jos jätät nämä tyhjiksi, tunnusvälityspiste palauttaa 503 (fail-closed) eikä
+ajo pääse push-vaiheeseen asti.
+
 ### 4. Rakenna kontti-image agentin ajoa varten
 
 Tuotantotilassa jokainen ajo suoritetaan erillisessä, kovennetussa
@@ -222,7 +266,34 @@ joka kelpaa kaikille projekteille ja kaikille ajoille:
 > in-process-tilaa — ks. [Paikallinen kehitys](#paikallinen-kehitys). Eristysmalli
 > ei silloin ole voimassa, joten käytä sitä vain luotetussa ympäristössä.
 
-### 5. Käynnistä järjestelmä
+### 5. Valmistele työhakemisto ja esikloonaa kohderepositorio
+
+Suorituskone **ei kloonaa kohderepositoriota itse** — se luo jokaiselle ajolle
+git-worktreen valmiista kloonista. Ilman valmista kloonia jokainen ajo kaatuu
+virheeseen `not a git repository`. Luo työhakemisto ja kloonaa projekti sinne
+kerran:
+
+```sh
+mkdir -p deploy/work
+git clone https://github.com/<omistaja>/<repo>.git deploy/work/repo
+```
+
+Aseta sitten `deploy/.env`-tiedostoon työhakemiston **host-absoluuttinen**
+polku:
+
+```sh
+# deploy/.env
+FLOW_WORK_DIR=/absoluuttinen/polku/flow/deploy/work
+```
+
+Miksi absoluuttinen polku: suorituskone käskyttää isäntäkoneen Docker-daemonia
+(Docker-outside-of-Docker), joten per-ajo-työhakemiston liitospolun on
+resolvoiduttava isäntäkoneen polkuna. Compose liittää `FLOW_WORK_DIR`-hakemiston
+suorituskoneen konttiin täsmälleen samaan polkuun kuin isäntäkoneella, ja
+kohderepositorion kloonin odotetaan olevan hakemistossa `$FLOW_WORK_DIR/repo`
+(compose johtaa `FLOW_REPO_ROOT`-asetuksen siitä).
+
+### 6. Käynnistä järjestelmä
 
 Käynnistä keskus, tietokanta, suorituskone, ulosmenosuodatin ja hallintanäkymä:
 
@@ -246,7 +317,7 @@ Oletusportit:
 - **Keskuspalvelu (flowd):** `http://<palvelin>:8080`
 - **Hallintanäkymä (dashboard):** `http://<palvelin>:8090`
 
-### 6. Tarkista että toimii
+### 7. Tarkista että toimii
 
 Avaa hallintanäkymä selaimessa osoitteesta `http://<palvelin>:8090`. Sen pitäisi
 latautua ja näyttää (toistaiseksi tyhjä) lista suorituskoneista ja ajoista.
@@ -302,6 +373,10 @@ keskukselle. Ohjattu toiminto kysyy tarvittavat tiedot:
 ```sh
 flowctl init
 ```
+
+> **Edellytys:** organisaatiolla on oltava GitHub App -asennus keskuksen
+> rekisterissä (käyttöönoton kohta 3(d)). Muuten rekisteröinti palauttaa
+> virheen `412: no github app installation for org`.
 
 Se ehdottaa oletuksia nykyisen hakemiston Git-etäosoitteen perusteella, joten
 useimmiten riittää painaa Enteriä. Kysyttävät kentät:
@@ -469,7 +544,11 @@ docs/                              arkkitehtuuri ja kaaviot
 | Oire | Todennäköinen syy / korjaus |
 |---|---|
 | `flowctl status` ei näytä suorituskoneita | Tarkista, että `flow-runner` on käynnissä (`docker compose ps`) ja että se on rekisteröitynyt (`docker compose logs flow-runner`). |
+| `docker compose up` kaatuu virheeseen `set FLOW_WORK_DIR to host abs path of deploy/work` | `FLOW_WORK_DIR` puuttuu `deploy/.env`-tiedostosta. Ks. käyttöönotto kohta 5. |
+| Ajo kaatuu heti virheeseen `not a git repository` | Kohderepositoriota ei ole esikloonattu hakemistoon `$FLOW_WORK_DIR/repo`. Ks. käyttöönotto kohta 5. |
+| `flowctl init` palauttaa 412 (`no github app installation for org`) | Organisaatiolta puuttuu GitHub App -asennus keskuksen rekisteristä. Ks. käyttöönotto kohta 3(d). |
 | `flowctl login` palauttaa 503 | `FLOW_GITHUB_OAUTH_CLIENT_ID` puuttuu keskuksen asetuksista. Ks. käyttöönotto kohta 3(b). |
+| Ajo etenee push-vaiheeseen mutta PR ei aukea, lokissa 503 tunnusvälityksestä | `FLOW_BROKER_TOKEN` on tyhjä (fail-closed) tai `FLOW_RUNNER_TOKEN` ei vastaa sitä. Ks. käyttöönotto kohta 3(d). |
 | Tehtävä ei lähde käyntiin merkinnän lisäämisen jälkeen | Onko `auto-run`-merkintä juuri kyseinen, jonka projekti odottaa? Onko keskuksella lukuoikeus (`FLOW_GITHUB_TOKEN`)? Tarkistus tehdään tarkkailuvälein (oletus 60 s). |
 | Ajo jää tilaan `awaiting_clarification` | Agentti tarvitsee lisätietoa. Vastaa tehtävän kommenttiin esitettyyn kysymykseen. |
 | `flow-runner: FLOW_RUNNER_MODE=container but docker not in PATH` | Kontti-tila vaatii Dockerin. Kehityskoneella käytä `FLOW_RUNNER_MODE=inproc` tai asenna Docker. |

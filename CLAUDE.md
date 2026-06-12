@@ -54,10 +54,12 @@ puhtaana käyttöönotto-/käyttöoppaana — roadmap asuu **tässä**.
   gVisor opt-in [#14](https://github.com/Silon-Oy/flow/issues/14),
   Prometheus /metrics [#22](https://github.com/Silon-Oy/flow/issues/22).
 
-**MVP-viimeistelyn este:** push/PR-autentikointi
-[#34](https://github.com/Silon-Oy/flow/issues/34) — päästä-päähän-ajo katkeaa
-tällä hetkellä push-vaiheeseen, koska viimeisen mailin GitHub-credentiaali
-puuttuu (token broker → runner → push).
+Push/PR-autentikointi
+[#34](https://github.com/Silon-Oy/flow/issues/34) on ratkaistu (token broker →
+runner → push; container-tilan korjaukset PR #43): päästä-päähän-ajo toimii,
+kun GitHub App + broker-token on konfiguroitu ja kohderepo esikloonattu —
+käyttöönottovaatimukset on dokumentoitu README:n "Käyttöönotto vaihe
+vaiheelta" -osiossa.
 
 Suunnitelman §17 avoimet päätökset (10–14) on ratkaistu ja kirjattu
 päätöslokiin §2.2 ([#15](https://github.com/Silon-Oy/flow/issues/15) suljettu).
