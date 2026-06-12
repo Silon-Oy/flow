@@ -263,6 +263,25 @@ flowctl status
 Tulosteessa pitäisi näkyä ainakin yksi rekisteröitynyt suorituskone (compose-pinon
 `flow-runner`), jonka tila on aktiivinen ja elossapitoviesti (heartbeat) tuore.
 
+### Päivittäminen uuteen versioon
+
+Aja tuotantopalvelimella repon juuresta:
+
+```sh
+./deploy/deploy.sh
+```
+
+Skripti hakee `origin/main`-haaran (vain fast-forward), rakentaa muuttuneet
+imaget ja käynnistää muuttuneet kontit uudelleen (`docker compose up -d
+--build`). Tietokantamigraatiot ajetaan automaattisesti `flowd`-palvelun
+käynnistyessä, ja Postgres-data säilyy `deploy/pgdata`-kansiossa. Skripti
+kieltäytyy ajamasta, jos työpuussa on committoimattomia muutoksia, eikä
+koskaan nollaa repoa.
+
+> Huom: skripti ei rakenna orkestraattorin ajokuvaa (`flow-orchestrator`) —
+> se ei ole compose-palvelu. Jos päivitys koskee agentin kehotteita tai
+> orkestraattorin koodia, aja lisäksi kohdan 4 `docker build` uudelleen.
+
 ---
 
 ## Käyttö
