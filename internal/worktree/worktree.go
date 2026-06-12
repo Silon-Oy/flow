@@ -70,11 +70,52 @@ func Create(repoRoot, runID, branch, baseBranch, remote string) (string, error) 
 		}
 	}
 
+	// `git worktree add -b` is not idempotent: a crashed earlier run for the
+	// same issue leaves its branch (and worktree) behind, and every retry would
+	// fail here forever (issue #44). Clear the residue first.
+	removeStaleBranch(repoRoot, branch)
+
 	cmd := exec.Command("git", "-C", repoRoot, "worktree", "add", "-b", branch, wtPath, baseRef)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("worktree add: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return wtPath, nil
+}
+
+// removeStaleBranch clears what a crashed run left behind: the linked worktree
+// still holding branch (whatever run ID it was created under) and the local
+// branch itself. Best-effort by design — git refuses to remove the MAIN
+// working tree and to delete its checked-out branch, so a branch in use there
+// surfaces as a normal Create error instead of data loss.
+func removeStaleBranch(repoRoot, branch string) {
+	// Drop tracking entries whose dirs were already deleted manually; otherwise
+	// the branch still counts as checked out and cannot be deleted.
+	_ = exec.Command("git", "-C", repoRoot, "worktree", "prune").Run()
+	if wt := worktreePathForBranch(repoRoot, branch); wt != "" {
+		_ = exec.Command("git", "-C", repoRoot, "worktree", "remove", "--force", wt).Run()
+	}
+	if exec.Command("git", "-C", repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch).Run() == nil {
+		_ = exec.Command("git", "-C", repoRoot, "branch", "-D", branch).Run()
+	}
+}
+
+// worktreePathForBranch returns the path of the worktree that has branch
+// checked out, or "" if none.
+func worktreePathForBranch(repoRoot, branch string) string {
+	out, err := exec.Command("git", "-C", repoRoot, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return ""
+	}
+	var path string
+	for _, line := range strings.Split(string(out), "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			path = strings.TrimPrefix(line, "worktree ")
+		case line == "branch refs/heads/"+branch:
+			return path
+		}
+	}
+	return ""
 }
 
 func resolveBaseRef(repoRoot, baseBranch, remote string) string {
@@ -91,18 +132,36 @@ func resolveBaseRef(repoRoot, baseBranch, remote string) string {
 	return "HEAD"
 }
 
-// Cleanup removes the worktree dir AND its tracking entry. Best-effort; only
-// called in rollback paths.
+// Cleanup removes the worktree dir, its tracking entry AND the run branch it
+// had checked out. Best-effort; only called in rollback paths, where the
+// branch holds nothing worth keeping — leaving it would wedge the next run
+// for the same issue (issue #44).
 func Cleanup(wtPath string) error {
 	if _, err := os.Stat(wtPath); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	out, err := exec.Command("git", "-C", wtPath, "rev-parse", "--show-toplevel").Output()
-	if err == nil {
-		repoTop := strings.TrimSpace(string(out))
-		if err := exec.Command("git", "-C", repoTop, "worktree", "remove", "--force", wtPath).Run(); err == nil {
-			return nil
+	// Resolve the run branch and the main repo BEFORE removing the worktree —
+	// neither can be read from a deleted dir.
+	var branch, mainRepo string
+	if out, err := exec.Command("git", "-C", wtPath, "rev-parse", "--abbrev-ref", "HEAD").Output(); err == nil {
+		if b := strings.TrimSpace(string(out)); b != "HEAD" {
+			branch = b
 		}
 	}
-	return os.RemoveAll(wtPath)
+	if out, err := exec.Command("git", "-C", wtPath, "rev-parse", "--path-format=absolute", "--git-common-dir").Output(); err == nil {
+		mainRepo = filepath.Dir(strings.TrimSpace(string(out)))
+	}
+
+	removed := false
+	if err := exec.Command("git", "-C", wtPath, "worktree", "remove", "--force", wtPath).Run(); err == nil {
+		removed = true
+	}
+	var rmErr error
+	if !removed {
+		rmErr = os.RemoveAll(wtPath)
+	}
+	if branch != "" && mainRepo != "" && mainRepo != wtPath {
+		_ = exec.Command("git", "-C", mainRepo, "branch", "-D", branch).Run()
+	}
+	return rmErr
 }

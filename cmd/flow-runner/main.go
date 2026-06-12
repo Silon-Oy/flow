@@ -313,6 +313,9 @@ func runInContainer(ctx context.Context, cli *centralclient.Client, work *lease.
 	// would otherwise mount the Docker socket into the untrusted container.
 	args := spec.DockerArgs()
 	if runnerexec.HasForbiddenMounts(args) {
+		// Remove the worktree+branch so the next run for this issue can start
+		// cleanly — `git worktree add -b` fails on residue (issue #44).
+		_ = worktree.Cleanup(wt)
 		_ = cli.PatchRun(ctx, runID, map[string]any{
 			"status":         "blocked",
 			"blocked_reason": "refusing_dispatch: forbidden mount (§11.1)",
@@ -348,7 +351,9 @@ func runInContainer(ctx context.Context, cli *centralclient.Client, work *lease.
 	}
 	if containerErr != nil {
 		// Died without finalizing (crash/OOM): do not push a half-finished
-		// worktree; the host owns this transition.
+		// worktree; the host owns this transition. Discard the worktree+branch
+		// so the residue cannot wedge the issue's next run (issue #44).
+		_ = worktree.Cleanup(wt)
 		_ = cli.PatchRun(ctx, runID, map[string]any{
 			"status":         "blocked",
 			"blocked_reason": "container_exited_uncleanly: " + containerErr.Error(),
