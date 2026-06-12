@@ -13,12 +13,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -206,7 +208,7 @@ func pullAndRun(ctx context.Context, cli *centralclient.Client, runnerID, repoRo
 	// §11.3 model C (decision 19): push/PR authenticate with a broker-minted
 	// App token on this (trusted) side — never the host's ambient gh login.
 	// Every side effect re-verifies the lease (§10/R5).
-	gitOps := brokerGitOps(cli, work.Remote, lz.ID)
+	gitOps := brokerGitOps(cli, central, work.Remote, lz.ID)
 
 	outcome, err := o.Run(runCtx, gitOps)
 	if err != nil {
@@ -220,10 +222,18 @@ func pullAndRun(ctx context.Context, cli *centralclient.Client, runnerID, repoRo
 
 // brokerGitOps builds the credentialed, lease-gated GitOps for a run's
 // GitHub writes (§11.3 model C).
-func brokerGitOps(cli *centralclient.Client, remote, leaseID string) *runnergit.GitOps {
+//
+// The App-token broker authenticates with the pre-shared FLOW_BROKER_TOKEN
+// (deployed as the runner's FLOW_RUNNER_TOKEN seed), NOT the per-runner token
+// that RegisterRunner minted into `cli` — the broker endpoint still rides the
+// pre-shared bearer (folding it onto runner tokens is the #8 follow-up). So the
+// Minter uses a separate client carrying the seed, while VerifyLease keeps using
+// the lease-scoped `cli` for the heartbeat.
+func brokerGitOps(cli *centralclient.Client, central, remote, leaseID string) *runnergit.GitOps {
+	brokerCli := centralclient.New(central, os.Getenv("FLOW_RUNNER_TOKEN"))
 	return &runnergit.GitOps{
 		Remote: remote,
-		Minter: cli,
+		Minter: brokerCli,
 		VerifyLease: func(ctx context.Context) error {
 			return cli.LeaseHeartbeat(ctx, leaseID)
 		},
@@ -267,6 +277,17 @@ func runInContainer(ctx context.Context, cli *centralclient.Client, work *lease.
 			"finished":       true,
 		})
 		return nil
+	}
+
+	// Fetch the issue body/comments/images on the trusted host (it holds the
+	// GitHub token) and stage them into the worktree so the tokenless container
+	// can build the agent prompt. Without this the agent gets only the issue
+	// number and no task — it does nothing and the push is empty. The orchestrator
+	// reads and deletes the staged file before any commit (§11.3: token stays on
+	// the host; the issue text is not a secret).
+	issueDoc, imageURLs := fetchIssueContext(ctx, work, repoRoot)
+	if err := writeIssueContext(wt, issueDoc, imageURLs); err != nil {
+		log.Printf("flow-runner: stage issue context for run %s: %v", runID, err)
 	}
 
 	spec := runnerexec.Spec{
@@ -337,7 +358,7 @@ func runInContainer(ctx context.Context, cli *centralclient.Client, work *lease.
 	}
 
 	reporter := orchestrator.NewHTTPReporter(cli, runID)
-	outcome, err := orchestrator.FinishGitHub(ctx, reporter, brokerGitOps(cli, work.Remote, leaseID),
+	outcome, err := orchestrator.FinishGitHub(ctx, reporter, brokerGitOps(cli, central, work.Remote, leaseID),
 		wt, branch, "", work.IssueNumber)
 	if err != nil {
 		log.Printf("flow-runner: run %s finish error: %v", runID, err)
@@ -372,6 +393,11 @@ func runOrchestrate(runID string) error {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-stop; cancel() }()
 
+	// Stage the Claude credential where claude-code expects it before any agent
+	// call; otherwise every claude invocation reports "Not logged in" and returns
+	// empty, so the agent does nothing (§11.5 Model B).
+	stageClaudeCredential()
+
 	cli := centralclient.New(central, token)
 
 	run, err := cli.GetRun(ctx, runID)
@@ -387,16 +413,22 @@ func runOrchestrate(runID string) error {
 	}
 
 	reporter := orchestrator.NewHTTPReporter(cli, runID)
+	// Issue body/comments/images are fetched on the trusted host (it holds the
+	// GitHub token) and staged into the worktree (.flow-issue.json); read them
+	// here so the agent prompt carries the actual task. readIssueContext deletes
+	// the file so it never lands in the commit/PR. §11.3: no token in the sandbox.
+	issueDoc, imageURLs := readIssueContext("/work")
 	cfg := orchestrator.Config{
-		RunID:        runID,
-		WorktreePath: "/work", // single host mount; orchestrator skips S4 create
-		Remote:       run.Remote,
-		Branch:       branch,
-		IssueNumber:  run.IssueNumber,
-		// Issue body/comments/images are fetched on the trusted host (it holds the
-		// GitHub token); the container path will receive them via the run record in
-		// a later pass. Left empty here so the sandbox never needs a token.
-		AutoMode: true,
+		RunID:          runID,
+		WorktreePath:   "/work", // single host mount; orchestrator skips S4 create
+		Remote:         run.Remote,
+		Branch:         branch,
+		IssueNumber:    run.IssueNumber,
+		IssueTitle:     issueDoc.title,
+		IssueBody:      issueDoc.body,
+		IssueComments:  issueDoc.comments,
+		IssueImageURLs: imageURLs,
+		AutoMode:       true,
 		// §11.3 model C: stop after S9 — push/PR happen on the runner host with
 		// the broker token after this container exits. This process never holds
 		// a GitHub credential (invariant 3).
@@ -540,6 +572,77 @@ func fetchIssueContext(ctx context.Context, work *lease.Work, repoRoot string) (
 		cs = append(cs, orchestrator.IssueComment{Author: c.Author, Body: c.Body})
 	}
 	return issueContext{title: is.Title, body: is.Body, comments: cs}, urls
+}
+
+// issueStageFile is the dotfile the trusted host writes into the per-run worktree
+// to hand the issue task to the tokenless orchestrator container. §11.3 keeps the
+// GitHub *token* on the host; the issue *text* is not a secret, so staging it via
+// the shared worktree is safe. The orchestrator reads it and deletes it before
+// any commit so it never lands in the PR.
+const issueStageFile = ".flow-issue.json"
+
+type stagedIssue struct {
+	Title     string                      `json:"title"`
+	Body      string                      `json:"body"`
+	Comments  []orchestrator.IssueComment `json:"comments"`
+	ImageURLs []string                    `json:"image_urls"`
+}
+
+// writeIssueContext stages the fetched issue into the worktree so the container
+// (which holds no GitHub token, §11.3) can build the agent prompt from it.
+func writeIssueContext(worktree string, doc issueContext, urls []string) error {
+	b, err := json.Marshal(stagedIssue{
+		Title: doc.title, Body: doc.body, Comments: doc.comments, ImageURLs: urls,
+	})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(worktree, issueStageFile), b, 0o644)
+}
+
+// readIssueContext loads the staged issue inside the container and removes the
+// file so it is never committed into the PR. A missing/invalid file degrades to
+// an empty context — the run still proceeds rather than stranding the lease.
+func readIssueContext(worktree string) (issueContext, []string) {
+	path := filepath.Join(worktree, issueStageFile)
+	b, err := os.ReadFile(path)
+	_ = os.Remove(path) // best-effort: keep it out of the commit regardless of parse
+	if err != nil {
+		return issueContext{}, nil
+	}
+	var s stagedIssue
+	if err := json.Unmarshal(b, &s); err != nil {
+		return issueContext{}, nil
+	}
+	return issueContext{title: s.Title, body: s.Body, comments: s.Comments}, s.ImageURLs
+}
+
+// stageClaudeCredential copies the read-only mounted Claude credential (Model B,
+// §11.5) into $HOME/.claude/.credentials.json, where claude-code actually looks
+// for it. runnerexec mounts it at /run/claude-credentials.json:ro; claude-code
+// never reads from that path. Without this staging the agent reports "Not logged
+// in" and every claude call returns empty -> the agent does nothing. No-op if the
+// mount is absent (dev / no-Claude runs).
+func stageClaudeCredential() {
+	const src = "/run/claude-credentials.json"
+	b, err := os.ReadFile(src)
+	if err != nil {
+		return // not mounted — degrade rather than fail the run
+	}
+	home := os.Getenv("HOME")
+	if home == "" {
+		home = "/home/node"
+	}
+	dir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Printf("flow-orchestrator: mkdir %s: %v", dir, err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), b, 0o600); err != nil {
+		log.Printf("flow-orchestrator: stage claude credential: %v", err)
+		return
+	}
+	log.Printf("flow-orchestrator: staged claude credential into %s", dir)
 }
 
 func itoa(n int) string {
