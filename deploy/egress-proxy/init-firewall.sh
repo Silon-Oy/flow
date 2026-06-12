@@ -54,8 +54,18 @@ iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
 iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
 
-# Allow egress only to the resolved allow-list IPs.
+# Allow egress to the resolved allow-list IPs (fast path for stable hosts).
 iptables -A OUTPUT -m set --match-set allowed-egress dst -j ACCEPT
+
+# Allow HTTP/HTTPS egress for the proxy itself. The hard domain allow-list is
+# enforced by squid (dstdomain ACLs in squid.conf): squid only opens upstream
+# connections to allow-listed domains, so an IP-level deny here is redundant AND
+# brittle — CDN hosts (github/codeload/packagist) rotate IPs that were resolved
+# only at startup, so package downloads intermittently hit un-resolved IPs and
+# fail (composer/npm flakiness). Trusting squid's domain ACL for the egress
+# decision and allowing 80/443 out removes that flakiness while the proxy stays
+# the single, logged choke point (§11.6). Non-HTTP egress is still denied.
+iptables -A OUTPUT -p tcp -m multiport --dports 80,443 -j ACCEPT
 
 # Default deny everything else, with a log target for §11.6 visibility.
 iptables -A OUTPUT -j LOG --log-prefix "FLOW-EGRESS-DENIED: " --log-level 4

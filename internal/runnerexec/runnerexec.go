@@ -17,6 +17,7 @@ package runnerexec
 
 import (
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -108,6 +109,17 @@ func (s Spec) DockerArgs() []string {
 	// remains satisfied (asserted by the test).
 	if s.CentralURL != "" {
 		args = append(args, "-e", "FLOW_CENTRAL_URL="+s.CentralURL)
+		// Central traffic is a trusted internal callback (run config + telemetry,
+		// authenticated by the lease-scoped runner token). It must NOT traverse the
+		// egress allow-list proxy, which default-denies non-allow-listed hosts like
+		// flowd. NO_PROXY makes the orchestrator reach the central directly over the
+		// shared egress network; only the agent's outbound github/npm/anthropic
+		// traffic rides the proxy. This does not weaken §11.3 — no credential is
+		// exposed, and the central is a trusted component.
+		if host := centralHost(s.CentralURL); host != "" {
+			noProxy := host + ",localhost,127.0.0.1"
+			args = append(args, "-e", "NO_PROXY="+noProxy, "-e", "no_proxy="+noProxy)
+		}
 	}
 	if s.CentralToken != "" {
 		args = append(args, "-e", "FLOW_RUNNER_TOKEN="+s.CentralToken)
@@ -152,6 +164,18 @@ func HasForbiddenMounts(args []string) bool {
 		}
 	}
 	return false
+}
+
+// centralHost extracts the hostname (no port) from the central URL so it can be
+// added to NO_PROXY. Returns "" if the URL does not parse — the caller then skips
+// NO_PROXY and the central call falls back to the proxy path (which will fail
+// closed if the host is not allow-listed, surfacing a clear error).
+func centralHost(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 func sortedKeys(m map[string]string) []string {
