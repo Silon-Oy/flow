@@ -73,6 +73,83 @@ func TestCreateAndCleanup(t *testing.T) {
 	if _, err := os.Stat(wt); !os.IsNotExist(err) {
 		t.Errorf("worktree dir still present after cleanup")
 	}
+	// Cleanup is a rollback: the run branch goes with the worktree, so the
+	// issue's next run can `worktree add -b` the same branch again (issue #44).
+	if err := exec.Command("git", "-C", repo, "rev-parse", "--verify", "--quiet",
+		"refs/heads/"+branch).Run(); err == nil {
+		t.Errorf("branch %s still present after cleanup", branch)
+	}
+}
+
+// TestCreateIdempotentAfterCrash: a crashed run leaves its branch (and maybe
+// worktree) behind; Create for the SAME issue branch under a new run ID must
+// clear the residue and succeed instead of looping on "branch already exists"
+// (issue #44).
+func TestCreateIdempotentAfterCrash(t *testing.T) {
+	branch := "auto-run/issue-44"
+	cases := []struct {
+		name    string
+		residue func(t *testing.T, repo string)
+	}{
+		{"branch and worktree left behind", func(t *testing.T, repo string) {
+			if _, err := Create(repo, "run-old", branch, "", "origin"); err != nil {
+				t.Fatalf("residue Create: %v", err)
+			}
+		}},
+		{"branch only", func(t *testing.T, repo string) {
+			gitRun(t, repo, "branch", branch)
+		}},
+		{"worktree dir deleted manually, tracking entry stale", func(t *testing.T, repo string) {
+			wt, err := Create(repo, "run-old", branch, "", "origin")
+			if err != nil {
+				t.Fatalf("residue Create: %v", err)
+			}
+			if err := os.RemoveAll(wt); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := makeRepo(t)
+			tc.residue(t, repo)
+
+			wt, err := Create(repo, "run-new", branch, "", "origin")
+			if err != nil {
+				t.Fatalf("Create after residue: %v", err)
+			}
+			out, err := exec.Command("git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD").Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := string(out); got != branch+"\n" {
+				t.Errorf("worktree branch = %q, want %q", got, branch)
+			}
+		})
+	}
+}
+
+// TestCreateBranchCheckedOutInMainWorktree: when the run branch is checked out
+// in the MAIN working tree, Create must fail with an error — never remove the
+// main tree or its branch.
+func TestCreateBranchCheckedOutInMainWorktree(t *testing.T) {
+	repo := makeRepo(t)
+	branch := "auto-run/issue-9"
+	gitRun(t, repo, "checkout", "-qb", branch)
+
+	if _, err := Create(repo, "rid", branch, "", "origin"); err == nil {
+		t.Fatal("Create should fail when branch is checked out in the main worktree")
+	}
+	if _, err := os.Stat(filepath.Join(repo, "f.txt")); err != nil {
+		t.Errorf("main worktree damaged: %v", err)
+	}
+	out, err := exec.Command("git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(out); got != branch+"\n" {
+		t.Errorf("main worktree HEAD = %q, want %q", got, branch)
+	}
 }
 
 // TestFetchNoRemote: fetching a missing remote is a benign no-op.
