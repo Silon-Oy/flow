@@ -54,6 +54,13 @@ services:
       FLOW_GITHUB_APP_KEY_DEFAULT: ${FLOW_GITHUB_APP_KEY_DEFAULT:-}
     ports:
       - "8080:8080"
+    networks:
+      # default for the rest of the stack; flow-egress so the per-run orchestrator
+      # containers (attached only to flow-egress) can reach the central directly
+      # for run config + telemetry, bypassing the egress allow-list proxy via
+      # NO_PROXY (set by internal/runnerexec). Central traffic is trusted internal.
+      - default
+      - flow-egress
 
   # The runner-host egress proxy (§11.2): default-deny allow-list. The per-run
   # orchestrator containers attach ONLY to flow-egress and route out through here.
@@ -88,7 +95,14 @@ services:
     environment:
       FLOW_CENTRAL_URL: "http://flowd:8080"
       FLOW_RUNNER_TOKEN: ${FLOW_RUNNER_TOKEN:-}
-      FLOW_REPO_ROOT: /work/repo
+      # The trusted host fetches the issue body/comments before dispatch (it holds
+      # the GitHub token; the container never does, §11.3). Without this the issue
+      # fetch is anonymous -> 404 on private repos -> the agent gets an empty task.
+      FLOW_GITHUB_TOKEN: ${FLOW_GITHUB_TOKEN:-}
+      # DooD: the runner shells out to the HOST docker daemon, so per-run worktree
+      # bind-mounts must resolve as HOST paths. Point the repo root at the work dir
+      # mounted at its host-absolute path (see volumes), not the in-container /work.
+      FLOW_REPO_ROOT: ${FLOW_WORK_DIR:?set FLOW_WORK_DIR to host abs path of deploy/work}/repo
       FLOW_POLL_INTERVAL: ${FLOW_POLL_INTERVAL:-15s}
       # Container dispatch (§11.1): "container" launches each run inside a
       # hardened ephemeral flow-orchestrator container; "inproc" keeps the
@@ -97,7 +111,16 @@ services:
       FLOW_ORCHESTRATOR_IMAGE: ${FLOW_ORCHESTRATOR_IMAGE:-flow-orchestrator:latest}
       FLOW_RUNNER_NAME: ${FLOW_RUNNER_NAME:-}
       FLOW_CLAUDE_CRED_PATH: ${FLOW_CLAUDE_CRED_PATH:-}
-      HTTPS_PROXY: "http://egress-proxy:3128"
+      # The Debian docker.io CLI speaks API 1.41; the host daemon (Docker 29)
+      # requires >= 1.44. Pin the API version so the runner's `docker run`
+      # dispatch to the host daemon negotiates a supported version.
+      DOCKER_API_VERSION: "1.44"
+      # NOTE: the runner is a TRUSTED host process. Its own git push / gh pr create
+      # (§11.3 model C, decision 19) must reach github.com DIRECTLY with the broker
+      # token — NOT through the egress allow-list proxy (which is for the UNTRUSTED
+      # orchestrator container only, injected separately by internal/runnerexec).
+      # Setting HTTPS_PROXY here routed the trusted push through squid -> 503. The
+      # runner reaches the central via the internal network; no proxy needed.
       # §11.6: shipper tails squid's access.log out of the shared volume.
       FLOW_EGRESS_LOG: /var/log/squid/access.log
     volumes:
@@ -105,7 +128,11 @@ services:
       # daemon is trusted; the UNTRUSTED orchestrator containers never get the
       # socket (§11.1 invariant).
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./work:/work
+      # DooD: mount the work dir at the SAME absolute path inside the runner as on
+      # the host, so the worktree path the runner hands to `docker run -v` (for the
+      # per-run orchestrator container) resolves on the host daemon. FLOW_WORK_DIR
+      # is the host-absolute path to deploy/work.
+      - ${FLOW_WORK_DIR:?set FLOW_WORK_DIR to host abs path of deploy/work}:${FLOW_WORK_DIR}
       # Read squid's access.log out of the same named volume the proxy writes.
       - egress-log:/var/log/squid:ro
 
@@ -123,8 +150,11 @@ services:
 
 networks:
   # Isolated network the untrusted per-run containers attach to; the only route
-  # out is the egress proxy.
+  # out is the egress proxy. Fixed `name` (no compose project prefix) so the
+  # runner's `docker run --network flow-egress` (internal/runnerexec) resolves —
+  # otherwise compose names it `<project>_flow-egress` and dispatch fails.
   flow-egress:
+    name: flow-egress
     internal: false
 
 volumes:
