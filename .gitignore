@@ -17,6 +17,14 @@
 # Postgres data (when running compose locally)
 deploy/pgdata/
 
+# Local deploy smoke-test override + orchestrator runtime work dir
+deploy/docker-compose.override.yml
+deploy/work/
+
+# /refresh command artifacts (personal, local-only)
+.claude/refresh-dev.log
+.claude/refresh.json
+
 # >>> /run-issues orchestrator runtime state (managed — do not edit) >>>
 # Per-run artefacts (logs, prompts, JSON state) and git worktrees created
 # by the /run-issues orchestrator. Auto-maintained — never version-controlled.
