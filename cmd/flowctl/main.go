@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"text/tabwriter"
@@ -53,7 +54,8 @@ Usage:
 
 Env:
   FLOW_CENTRAL_URL   central service base URL (default http://localhost:8080)
-  FLOW_TOKEN         session/runner token (optional in Vaihe 1)`)
+  FLOW_TOKEN         session/runner token (overrides the credentials file
+                     written by flowctl login)`)
 }
 
 func runStatus(args []string) error {
@@ -65,7 +67,11 @@ func runStatus(args []string) error {
 		}
 	}
 	central := envOr("FLOW_CENTRAL_URL", "http://localhost:8080")
-	cli := centralclient.New(central, os.Getenv("FLOW_TOKEN"))
+	token, err := resolveToken()
+	if err != nil {
+		return err
+	}
+	cli := centralclient.New(central, token)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -114,4 +120,16 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// resolveToken returns the session token for central API calls: FLOW_TOKEN
+// wins, otherwise the credentials file written by `flowctl login`.
+func resolveToken() (string, error) {
+	if t := os.Getenv("FLOW_TOKEN"); t != "" {
+		return t, nil
+	}
+	if t, err := readCredentialsToken(); err == nil && t != "" {
+		return t, nil
+	}
+	return "", errors.New("not signed in: run `flowctl login` or export FLOW_TOKEN")
 }
