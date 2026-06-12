@@ -45,21 +45,13 @@ func runInit(args []string) error {
 	}
 
 	central := envOr("FLOW_CENTRAL_URL", "http://localhost:8080")
-	token := os.Getenv("FLOW_TOKEN")
-	if token == "" {
-		// Try the credentials file from `flowctl login` so the user doesn't
-		// have to remember to export FLOW_TOKEN.
-		if t, err := readCredentialsToken(); err == nil {
-			token = t
-		}
-	}
-	if token == "" {
-		return errors.New("not signed in: run `flowctl login` or export FLOW_TOKEN")
+	token, err := resolveToken()
+	if err != nil {
+		return err
 	}
 	cli := centralclient.New(central, token)
 
 	var req centralclient.CreateProjectRequest
-	var err error
 	if configPath != "" {
 		req, err = loadProjectConfig(configPath)
 		if err != nil {
