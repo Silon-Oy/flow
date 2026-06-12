@@ -23,6 +23,11 @@ import (
 type GitOps interface {
 	// Install runs the dependency installer (npm/pnpm/yarn/composer) in dir.
 	Install(ctx context.Context, dir, manager string) error
+	// Commit stages all worktree changes and commits them. Returns committed=false
+	// (no error) when the agent produced no change. The agent edits files in the
+	// container but cannot run git there (the worktree's .git points at an
+	// unmounted host path), so the trusted runner commits on handoff.
+	Commit(ctx context.Context, dir, message string) (committed bool, err error)
 	// Push pushes branch from dir to its remote (auto-run/* only; enforced by
 	// the App-token scope + branch protection, §11.4 / decision 12).
 	Push(ctx context.Context, dir, branch string) error
@@ -38,6 +43,28 @@ type GitOps interface {
 type ShellGitOps struct {
 	// Remote is the git remote to push to (default "origin").
 	Remote string
+}
+
+// Commit stages all changes in the worktree and commits them with an explicit
+// identity (the runner container has no git user configured). Returns
+// committed=false when there is nothing staged — the agent produced no change.
+func (s ShellGitOps) Commit(ctx context.Context, dir, message string) (bool, error) {
+	if err := runIn(ctx, dir, "git", "add", "-A"); err != nil {
+		return false, fmt.Errorf("git add: %w", err)
+	}
+	// `git diff --cached --quiet` exits 0 when nothing is staged.
+	check := exec.CommandContext(ctx, "git", "diff", "--cached", "--quiet")
+	check.Dir = dir
+	if err := check.Run(); err == nil {
+		return false, nil // no changes to commit
+	}
+	if err := runIn(ctx, dir, "git",
+		"-c", "user.name=Flow auto-run",
+		"-c", "user.email=flow-auto-run@silon.local",
+		"commit", "-m", message); err != nil {
+		return false, fmt.Errorf("git commit: %w", err)
+	}
+	return true, nil
 }
 
 func (s ShellGitOps) Install(ctx context.Context, dir, manager string) error {
@@ -91,6 +118,11 @@ func AutoRunPRTitle(issueNumber int) string {
 // AutoRunPRBody is the canonical auto-run PR body.
 func AutoRunPRBody(issueNumber int) string {
 	return fmt.Sprintf("Automated PR for issue #%d (Flow auto-run).\n\nCloses #%d.", issueNumber, issueNumber)
+}
+
+// AutoRunCommitMessage is the canonical commit message for the agent's changes.
+func AutoRunCommitMessage(issueNumber int) string {
+	return fmt.Sprintf("Auto-run: implement issue #%d", issueNumber)
 }
 
 func runIn(ctx context.Context, dir, name string, args ...string) error {

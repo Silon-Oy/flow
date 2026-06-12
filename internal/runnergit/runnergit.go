@@ -76,6 +76,13 @@ func (g *GitOps) Install(ctx context.Context, dir, manager string) error {
 	return orchestrator.ShellGitOps{Remote: g.Remote}.Install(ctx, dir, manager)
 }
 
+// Commit delegates to ShellGitOps — committing the worktree needs no credential,
+// only the trusted runner's local git (which, unlike the container, can resolve
+// the worktree's .git pointer).
+func (g *GitOps) Commit(ctx context.Context, dir, message string) (bool, error) {
+	return orchestrator.ShellGitOps{Remote: g.Remote}.Commit(ctx, dir, message)
+}
+
 // Push pushes branch to the remote's https URL with the broker token in an
 // http.extraheader supplied via GIT_CONFIG_* env vars. Pushing the explicit
 // https URL (not the remote name) guarantees the App token is the credential

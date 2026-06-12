@@ -55,6 +55,9 @@ func (g *fakeGitOps) Install(_ context.Context, _ string, m string) error {
 	g.installs = append(g.installs, m)
 	return nil
 }
+func (g *fakeGitOps) Commit(_ context.Context, _, _ string) (bool, error) {
+	return true, nil
+}
 func (g *fakeGitOps) Push(_ context.Context, _, _ string) error {
 	if g.pushErr != nil {
 		return g.pushErr

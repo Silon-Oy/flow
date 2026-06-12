@@ -255,6 +255,18 @@ func (o *Orchestrator) Run(ctx context.Context, git GitOps) (Outcome, error) {
 func FinishGitHub(ctx context.Context, report Reporter, git GitOps, wt, branch, baseBranch string, issueNumber int) (Outcome, error) {
 	out := Outcome{Branch: branch, LastStep: StepEvolution}
 
+	// S9b: commit the agent's worktree changes on the trusted runner side. The
+	// agent edits files in the container but cannot run git there, so the commit
+	// happens here. No staged change => the agent produced nothing; block rather
+	// than push an empty branch (which fails PR creation with "no commits").
+	committed, err := git.Commit(ctx, wt, AutoRunCommitMessage(issueNumber))
+	if err != nil {
+		return failOutcome(ctx, report, out, StepPush, "blocked", "commit_failed: "+err.Error())
+	}
+	if !committed {
+		return failOutcome(ctx, report, out, StepPush, "blocked", "no_changes: agent produced no diff")
+	}
+
 	// S10: push the auto-run branch. Scope enforcement is the App-token
 	// permission + branch protection (§11.4 / decision 12), not the proxy.
 	_ = report.SetState(ctx, StepPush)
