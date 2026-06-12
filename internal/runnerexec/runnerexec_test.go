@@ -163,14 +163,16 @@ func TestSpecEnv_EmptyMap(t *testing.T) {
 		// Env intentionally nil.
 	}
 	args := spec.DockerArgs()
-	// Expected -e count: HTTP_PROXY, HTTPS_PROXY, FLOW_CENTRAL_URL, FLOW_RUNNER_TOKEN.
+	// Expected -e count: HTTP_PROXY, HTTPS_PROXY, FLOW_CENTRAL_URL, NO_PROXY,
+	// no_proxy, FLOW_RUNNER_TOKEN. NO_PROXY/no_proxy keep the trusted central
+	// callback off the egress allow-list proxy (it is denied there otherwise).
 	eCount := 0
 	for i := 0; i < len(args)-1; i++ {
 		if args[i] == "-e" {
 			eCount++
 		}
 	}
-	if eCount != 4 {
-		t.Errorf("expected 4 -e flags (proxy x2 + central x2), got %d: %v", eCount, args)
+	if eCount != 6 {
+		t.Errorf("expected 6 -e flags (proxy x2 + central + NO_PROXY x2 + token), got %d: %v", eCount, args)
 	}
 }
